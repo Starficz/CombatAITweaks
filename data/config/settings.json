@@ -1,0 +1,6 @@
+{
+	"plugins":{
+		"CATCombatPredictor":"org.starficz.combataitweaks.predictor.CATCombatPlugin"
+	}
+}
+

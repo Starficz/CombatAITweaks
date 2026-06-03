@@ -1,0 +1,13 @@
+{
+    "directDownloadURL": "https://github.com/Starficz/temp/releases/latest/download/temp.zip",
+    "changelogURL": "https://raw.githubusercontent.com/Starficz/temp/main/CHANGELOGS.md",
+    "masterVersionFile": "https://raw.githubusercontent.com/Starficz/temp/main/staruiframework.version",
+    "modName": "Combat AI Tweaks",
+    "modVersion":
+        {
+            "major": "1",
+            "minor": "0",
+            "patch": "0"
+        },
+    "modThreadId": 0
+}

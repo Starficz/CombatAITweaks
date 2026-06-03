@@ -1,0 +1,598 @@
+package org.starficz.combataitweaks
+
+import com.fs.graphics.Sprite
+import com.fs.starfarer.api.Global
+import com.fs.starfarer.api.combat.*
+import com.fs.starfarer.api.combat.BoundsAPI.SegmentAPI
+import com.fs.starfarer.api.graphics.SpriteAPI
+import com.fs.starfarer.api.util.Misc
+import org.lazywizard.lazylib.CollectionUtils
+import org.lazywizard.lazylib.CollectionUtils.CollectionFilter
+import org.lazywizard.lazylib.MathUtils
+import org.lazywizard.lazylib.VectorUtils
+import org.lazywizard.lazylib.combat.AIUtils
+import org.lwjgl.util.vector.Vector2f
+import org.starficz.combataitweaks.ReflectionUtils.invoke
+import java.awt.Color
+import java.awt.Point
+import kotlin.collections.firstOrNull
+import kotlin.collections.iterator
+import kotlin.isInfinite
+import kotlin.isNaN
+import kotlin.math.*
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.random.Random
+import kotlin.ranges.coerceAtLeast
+import kotlin.ranges.coerceIn
+
+fun SpriteAPI.cloneSpriteAPI(): SpriteAPI? {
+    // Invoke the getSprite method directly
+    val graphicsSprite = this.invoke("getSprite") as? Sprite ?: return null
+    val clonedGraphicsSprite = graphicsSprite.clone()
+
+    // Find the constructor that accepts the cloned Sprite
+    val constructor = ReflectionUtils.getConstructorsMatching(
+        clazz = this.javaClass,
+        parameterTypes = arrayOf(Sprite::class.java)
+    ).firstOrNull() ?: return null
+
+    return constructor.newInstance(clonedGraphicsSprite) as? SpriteAPI
+}
+
+fun isPointWithinMap(point: Vector2f, pad: Float): Boolean {
+    val engine = Global.getCombatEngine()
+    return (point.getX() < (engine.getMapWidth() / 2 - pad)) &&
+            (point.getX() > (pad - engine.getMapWidth() / 2)) &&
+            (point.getY() < (engine.getMapHeight() / 2 - pad)) &&
+            (point.getY() > (pad - engine.getMapHeight() / 2))
+}
+
+fun getBackingOffStrafePoint(ship: ShipAPI): Vector2f? {
+    val secondsInFuture = 1f
+    val degreeDelta = 5f
+    val futureLocation = Vector2f()
+    Vector2f.add(ship.location, ship.velocity, futureLocation)
+    futureLocation.scale(secondsInFuture)
+    var potentialPoints =
+        MathUtils.getPointsAlongCircumference(futureLocation, 1000f, (360f / degreeDelta).toInt(), 0f)
+    val filterBorder: CollectionFilter<Vector2f?> =
+        CollectionFilter<Vector2f?> { point -> isPointWithinMap(point!!, 200f) }
+
+
+    potentialPoints = CollectionUtils.filter<Vector2f?>(potentialPoints, filterBorder)
+    var safestPoint: Vector2f? = null
+    var furthestPointSumDistance = 0f
+    val enemies = AIUtils.getNearbyEnemies(ship, 3000f)
+    for (potentialPoint in potentialPoints) {
+        var currentPointSumDistance = 0f
+        for (enemy in enemies) {
+            if (enemy.getHullSize() != ShipAPI.HullSize.FIGHTER) currentPointSumDistance += MathUtils.getDistance(
+                enemy,
+                potentialPoint
+            )
+        }
+        if (currentPointSumDistance > furthestPointSumDistance) {
+            furthestPointSumDistance = currentPointSumDistance
+            safestPoint = potentialPoint
+        }
+    }
+
+    return safestPoint
+}
+
+fun calculateInterceptTime(
+    shooterPos: Vector2f,
+    shooterVel: Vector2f,
+    targetPos: Vector2f,
+    targetVel: Vector2f,
+    projectileSpeed: Float
+): Float? {
+    val relPos = Vector2f.sub(targetPos, shooterPos, null)
+    val relVel = Vector2f.sub(targetVel, shooterVel, null)
+
+    val a = Vector2f.dot(relVel, relVel) - (projectileSpeed * projectileSpeed)
+    val b = 2f * Vector2f.dot(relPos, relVel)
+    val c = Vector2f.dot(relPos, relPos)
+
+    val discriminant = b * b - 4f * a * c
+    if (discriminant < 0f) return null // Impossible to catch
+
+    val sqrtDisc = sqrt(discriminant)
+    val t1 = (-b + sqrtDisc) / (2f * a)
+    val t2 = (-b - sqrtDisc) / (2f * a)
+
+    if (max(t1, t2) < 0f) return null // Intercept is in the past
+
+    return if (t1 < 0f) t2 else if (t2 < 0f) t1 else min(t1, t2)
+}
+
+fun turnTowards(ship: ShipAPI, targetFacing: Float) {
+    val angularVel = ship.angularVelocity
+    val absAngularVel = abs(angularVel)
+    val turnDecel = ship.engineController.turnDeceleration
+
+    // Prevent division by zero if ship has no turn decel for some reason
+    if (turnDecel <= 0f) return
+
+    // Kinematic Equation: t = v / a
+    val timeToStop = absAngularVel / turnDecel
+
+    // Kinematic Equation: d = vt - 0.5 * a * t^2
+    val stoppingAngleDist = (absAngularVel * timeToStop) - (0.5f * turnDecel * timeToStop * timeToStop)
+
+    // Predict where the ship will be facing once it completely stops turning
+    val predictedFacing = ship.facing + sign(angularVel) * stoppingAngleDist
+
+    // LazyLib gets the absolute shortest angular distance between two angles
+    val diffPredictedToTarget = abs(MathUtils.getShortestRotation(predictedFacing, targetFacing))
+    val diffCurrentToTarget = abs(MathUtils.getShortestRotation(ship.facing, targetFacing))
+
+    // If the predicted stopping point is more than 1 degree away from our goal
+    if (diffPredictedToTarget > 1.0f) {
+
+        // MathUtils.getShortestRotation returns a positive value for Left turns, negative for Right turns.
+        // sign() normalizes this to 1.0f or -1.0f
+        var turnDir = sign(MathUtils.getShortestRotation(ship.facing, targetFacing))
+
+        // If we are currently rotating toward the target, BUT our stopping distance
+        // is greater than the distance to the target, we are going to overshoot!
+        if (sign(angularVel) == sign(turnDir) && stoppingAngleDist > diffCurrentToTarget) {
+            turnDir = -turnDir // Hit the brakes! (Reverse thrust)
+        }
+
+        // Execute the final thruster command
+        if (turnDir < 0f) {
+            ship.giveCommand(ShipCommand.TURN_RIGHT, null, 0)
+            ship.blockCommandForOneFrame(ShipCommand.TURN_LEFT)
+        } else if (turnDir > 0f) {
+            ship.giveCommand(ShipCommand.TURN_LEFT, null, 0)
+            ship.blockCommandForOneFrame(ShipCommand.TURN_RIGHT)
+        }
+    }
+}
+
+/**
+ * Calculates the on time remaining (IN + ACTIVE + OUT) for a ShipSystem.
+ * Returns full time if not currently active.
+ */
+fun ShipSystemAPI.getOnTimeRemaining(): Float {
+    return when (this.state) {
+        ShipSystemAPI.SystemState.IN -> {
+            val remainingIn = this.chargeUpDur * (1f - this.effectLevel)
+            val activeDur = if (this.specAPI.isToggle) 1000000f else this.chargeActiveDur
+
+            remainingIn + activeDur + this.chargeDownDur
+        }
+
+        ShipSystemAPI.SystemState.ACTIVE -> {
+            val chargeUp = this.chargeUpDur
+            val activeDur = if (this.specAPI.isToggle) 1000000f else this.chargeActiveDur
+            val totalDur = chargeUp + activeDur
+
+            // Algebraically solve for float_6 (elapsedActive) using the vanilla ChargeTracker formula:
+            // DisplayedLevel = (ChargeUp + Elapsed) / (ChargeUp + Active)
+            val elapsedActive = if (totalDur > 0f) {
+                (this.invoke("getDisplayedChargeLevel") as Float * totalDur) - chargeUp
+            } else {
+                0f
+            }
+
+            val remainingActive = (activeDur - elapsedActive).coerceAtLeast(0f)
+
+            remainingActive + this.chargeDownDur
+        }
+
+        ShipSystemAPI.SystemState.OUT -> this.chargeDownDur * this.effectLevel
+        ShipSystemAPI.SystemState.IDLE -> this.chargeUpDur + this.chargeActiveDur + this.chargeDownDur
+        ShipSystemAPI.SystemState.COOLDOWN -> this.chargeUpDur + this.chargeActiveDur + this.chargeDownDur
+    }
+}
+
+/**
+ * Calculates what the modified value of this MutableStat would be
+ * if a specific source ID's modifiers were completely ignored.
+ *
+ */
+fun MutableStat.getModifiedValueWithout(sourceId: String): Float {
+    var flatMod = 0f
+    var percentMod = 0f
+    var mult = 1f
+
+    // Sum up all flat mods, ignoring the target source ID
+    for ((id, mod) in this.flatMods) {
+        if (id != sourceId) {
+            flatMod += mod.value
+        }
+    }
+
+    // Sum up all percent mods, ignoring the target source ID
+    for ((id, mod) in this.percentMods) {
+        if (id != sourceId) {
+            percentMod += mod.value
+        }
+    }
+
+    // Multiply all mult mods, ignoring the target source ID
+    for ((id, mod) in this.multMods) {
+        if (id != sourceId) {
+            mult *= mod.value
+        }
+    }
+
+    // Replicate the exact formula from MutableStat.recompute()
+    var modified = this.baseValue + (this.baseValue * percentMod / 100.0f) + flatMod
+    modified *= mult
+
+    return modified
+}
+
+
+fun damageAfterArmor(
+    damageType: DamageType,
+    damage: Float,
+    hitStrength: Float,
+    armorValue: Float,
+    ship: ShipAPI
+): Pair<Float, Float> {
+    val stats: MutableShipStatsAPI = ship.mutableStats
+
+    // Get relevant stats modifiers
+    var armorMultiplier = stats.armorDamageTakenMult.modifiedValue // Use var as it changes
+    val effectiveArmorMult = stats.effectiveArmorBonus.bonusMult
+    var hullMultiplier = stats.hullDamageTakenMult.modifiedValue // Use var as it changes
+    val minArmor = stats.minArmorFraction.modifiedValue
+    val maxDR = stats.maxArmorDamageReduction.modifiedValue
+
+    // Adjust multipliers based on damage type
+    when (damageType) {
+        DamageType.FRAGMENTATION -> {
+            armorMultiplier *= (0.25f * stats.fragmentationDamageTakenMult.modifiedValue)
+            hullMultiplier *= stats.fragmentationDamageTakenMult.modifiedValue
+        }
+        DamageType.KINETIC -> {
+            armorMultiplier *= (0.5f * stats.kineticDamageTakenMult.modifiedValue)
+            hullMultiplier *= stats.kineticDamageTakenMult.modifiedValue
+        }
+        DamageType.HIGH_EXPLOSIVE -> {
+            armorMultiplier *= (2f * stats.highExplosiveDamageTakenMult.modifiedValue)
+            hullMultiplier *= stats.highExplosiveDamageTakenMult.modifiedValue
+        }
+        DamageType.ENERGY -> {
+            armorMultiplier *= stats.energyDamageTakenMult.modifiedValue
+            hullMultiplier *= stats.energyDamageTakenMult.modifiedValue
+        }
+        DamageType.OTHER -> {}
+    }
+
+    // Calculate damage reduction factor
+    val effectiveArmor = max(minArmor * ship.armorGrid.armorRating, armorValue) * effectiveArmorMult
+    val damageReductionFactor = (hitStrength * armorMultiplier) / (effectiveArmor + hitStrength * armorMultiplier)
+    val armorDR = max(1f - maxDR, damageReductionFactor)
+
+    // Calculate damage actually applied after reduction
+    val effectiveDamage = damage * armorDR
+
+    // Calculate damage dealt to the armor layer
+    val armorDamage = effectiveDamage * armorMultiplier
+
+    // Calculate damage penetrating to the hull
+    var hullDamage = 0f
+    if (armorDamage > armorValue) {
+        // Hull damage is the portion of effective damage corresponding to the excess armor damage
+        hullDamage = ((armorDamage - armorValue) / armorDamage) * effectiveDamage * hullMultiplier
+    }
+
+    // Return the pair of damages
+    return Pair(armorDamage, hullDamage)
+}
+
+/**
+ * Precomputed 5x5 weight mask based on Starsector armor rules.
+ * Indices [0..4][0..4] correspond to relative offsets [-2..2][-2..2].
+ * - Inner 3x3 cells (including center): weight 1.0
+ * - Outer 12 adjacent cells: weight 0.5
+ * - Corner 4 cells: weight 0.0
+ */
+private val ARMOR_MASK: Array<FloatArray> = run {
+    val mask = Array(5) { FloatArray(5) }
+    for (relX in -2..2) {
+        for (relY in -2..2) {
+            val dx = abs(relX)
+            val dy = abs(relY)
+            mask[relX + 2][relY + 2] = when {
+                dx <= 1 && dy <= 1 -> 1.0f // Inner 3x3
+                (dx == 2 && dy <= 1) || (dy == 2 && dx <= 1) -> 0.5f // Outer 12
+                else -> 0.0f // Corners
+            }
+        }
+    }
+    mask // Return the computed mask
+}
+
+/**
+ * Builds an integral image (summed-area table) for efficient region sum queries.
+ */
+private fun buildIntegralImage(grid: Array<FloatArray>, width: Int, height: Int, scale: Float = 1.0f): Array<FloatArray> {
+    val integral = Array(width + 1) { FloatArray(height + 1) } // Padded
+    for (x in 0..<width) {
+        var rowSum = 0f
+        for (y in 0..<height) {
+            rowSum += grid[x][y] * scale
+            integral[x + 1][y + 1] = integral[x][y + 1] + rowSum
+        }
+    }
+    return integral
+}
+
+/**
+ * Calculates the sum of values within a rectangular region using a precomputed integral image.
+ * Handles boundary clamping automatically.
+ */
+private fun getRegionSum(integral: Array<FloatArray>, x1: Int, y1: Int, x2: Int, y2: Int, width: Int, height: Int): Float {
+    val minX = max(0, x1)
+    val minY = max(0, y1)
+    val maxX = min(width - 1, x2)
+    val maxY = min(height - 1, y2)
+    if (minX > maxX || minY > maxY) return 0f
+    val iMaxX = maxX + 1
+    val iMaxY = maxY + 1
+    return integral[iMaxX][iMaxY] - integral[minX][iMaxY] - integral[iMaxX][minY] + integral[minX][minY]
+}
+
+
+/**
+ * Finds the coordinates of a candidate cell likely to have the lowest effective armor.
+ * Uses a fast scan based on the minimum unweighted sum in a 5x5 neighborhood.
+ * Only considers center cells where the 5x5 kernel fits entirely within the grid.
+ *
+ * @receiver armorGrid The ArmorGridAPI instance for the ship.
+ * @return A Point(x, y) representing the coordinates of the candidate cell,
+ *         or null if the grid is smaller than 5x5 or otherwise invalid.
+ */
+fun ArmorGridAPI.weakestArmorRegion(): Point? {
+    val grid: Array<FloatArray> = this.grid ?: return null
+    val width = this.leftOf + this.rightOf
+    val height = this.below + this.above
+
+    // Grid must be at least 5x5 to contain the kernel
+    if (width < 5 || height < 5) {
+        return null
+    }
+
+    // Fast Scan using Integral Image
+    val integralSum = buildIntegralImage(grid, width, height, 1.0f)
+
+    var minSum5x5 = Float.MAX_VALUE
+    var candidateX = -1
+    var candidateY = -1
+
+    // Iterate only through centers where the 5x5 kernel fits entirely
+    for (cx in 2..<width - 2) {
+        for (cy in 2..<height - 2) {
+            val x5_min = cx - 2
+            val y5_min = cy - 2
+            val x5_max = cx + 2
+            val y5_max = cy + 2
+
+            // Get the unweighted 5x5 sum efficiently
+            val currentSum5x5 = getRegionSum(integralSum, x5_min, y5_min, x5_max, y5_max, width, height)
+
+            if (currentSum5x5 < minSum5x5) {
+                minSum5x5 = currentSum5x5
+                candidateX = cx
+                candidateY = cy
+            }
+        }
+    }
+    return if (minSum5x5 == Float.MAX_VALUE) null else Point(candidateX, candidateY)
+}
+
+/**
+ * Calculates the accurate effective armor rating for a specific cell,
+ * based on the Starsector weighted sum rule, using the precomputed WEIGHT_MASK.
+ * Handles boundary conditions correctly (cells outside the grid contribute 0).
+ *
+ * @receiver The ArmorGridAPI instance for the ship.
+ * @param point A Point(x, y) representing the coordinates of the center cell for the calculation.
+ * @return The calculated effective armor rating (Float). Returns null if the grid is invalid.
+ */
+fun ArmorGridAPI.armorAtCell(point: Point): Float? {
+    val grid: Array<FloatArray> = this.grid ?: return 0.0f
+    val width = this.leftOf + this.rightOf
+    val height = this.below + this.above
+
+    if (width <= 0 || height <= 0) return 0.0f
+
+    var effectiveArmor: Float? = null
+
+    // Perform the accurate weighted sum, checking boundaries for each neighbor
+    for (relX in -2..2) {
+        for (relY in -2..2) {
+            val nx = point.x + relX
+            val ny = point.y + relY
+            // Check if the neighbor cell (nx, ny) is within the grid bounds
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                // Use the precomputed top-level weight mask
+                val weight = ARMOR_MASK[relX + 2][relY + 2]
+                if (effectiveArmor == null) effectiveArmor = 0f
+                if (weight > 0f) effectiveArmor += grid[nx][ny] * weight
+            }
+        }
+    }
+
+    return effectiveArmor
+}
+
+
+fun Float.isCloseTo(other: Float, epsilon: Float): Boolean {
+    if (this.isNaN() || other.isNaN())  return false
+    if (this.isInfinite() || other.isInfinite()) return this == other
+    return abs(this - other) <= epsilon
+}
+
+
+// Why does this not exist????
+fun Random.nextFloat(from: Number, until: Number): Float {
+    return Random.nextDouble(from.toDouble(), until.toDouble()).toFloat()
+}
+
+fun getNearestSegmentOnBounds(source: Vector2f, entity: CombatEntityAPI): Pair<SegmentAPI?, Vector2f> {
+
+    // Fall back to closest point on collision radius if entity lacks a BoundsAPI
+    val bounds = entity.exactBounds ?: return Pair(
+        null,
+        MathUtils.getPointOnCircumference(
+            entity.location,
+            entity.collisionRadius,
+            VectorUtils.getAngle(entity.location, source)
+        )
+    )
+
+    val closestPoint = Vector2f(entity.location)
+    var closestSegment = bounds.segments.firstOrNull()
+    var closestDistanceSquared = Float.MAX_VALUE
+    bounds.update(entity.location, entity.facing)
+    for (segment in bounds.segments) {
+        val tmp = MathUtils.getNearestPointOnLine(source, segment.p1, segment.p2)
+        val distanceSquared = MathUtils.getDistanceSquared(source, tmp)
+        if (distanceSquared < closestDistanceSquared) {
+            closestPoint.set(tmp)
+            closestSegment = segment
+            closestDistanceSquared = distanceSquared
+        }
+    }
+
+    return Pair(closestSegment, closestPoint)
+}
+/**
+ * Creates a new `Color` that is a brighter version of this
+ * `Color`.
+ *
+ *
+ * This method applies an arbitrary scale factor to each of the three RGB
+ * components of this `Color` to create a brighter version
+ * of this `Color`.
+ * The `alpha` value is preserved.
+ * Although `brighter` and
+ * `darker` are inverse operations, the results of a
+ * series of invocations of these two methods might be inconsistent
+ * because of rounding errors.
+ * @return     a new `Color` object that is
+ * a brighter version of this `Color`
+ * with the same `alpha` value.
+ * @see Color.darker
+ *
+ * @since      JDK1.0
+ */
+fun brighter(color: Color, factor: Float): Color {
+    var r = color.red
+    var g = color.green
+    var b = color.blue
+    val alpha = color.alpha
+
+    /* From 2D group:
+         * 1. black.brighter() should return grey
+         * 2. applying brighter to blue will always return blue, brighter
+         * 3. non pure color (non zero rgb) will eventually return white
+         */
+    val i = (1.0 / (1.0 - factor)).toInt()
+    if (r == 0 && g == 0 && b == 0) {
+        return Color(i, i, i, alpha)
+    }
+    if (r > 0 && r < i) r = i
+    if (g > 0 && g < i) g = i
+    if (b > 0 && b < i) b = i
+
+    return Color(
+        min((r / factor).toInt(), 255),
+        min((g / factor).toInt(), 255),
+        min((b / factor).toInt(), 255),
+        alpha
+    )
+}
+
+fun darker(color: Color, factor: Float): Color {
+    return Color(
+        max((color.red * factor).toInt(), 0),
+        max((color.green * factor).toInt(), 0),
+        max((color.blue * factor).toInt(), 0),
+        color.alpha
+    )
+}
+
+private data class LMS(val L: Float, val M: Float, val S: Float)
+
+// sRGB <-> Linear sRGB Conversion
+private fun srgbToLinearSrgb(x: Float): Float {
+    return if (x >= 0.04045f) ((x + 0.055f) / 1.055f).pow(2.4f) else (x / 12.92f)
+}
+
+private fun linearSrgbToSrgb(x: Float): Float {
+    return if (x >= 0.0031308f) (1.055f * x.pow(1.0f / 2.4f) - 0.055f) else (12.92f * x)
+}
+
+// Linear sRGB Conversion <-> LMS of OkLab
+private fun Color.toLMS(): LMS {
+    val linearRed = srgbToLinearSrgb(red/255f)
+    val linearGreen = srgbToLinearSrgb(green/255f)
+    val linearBlue = srgbToLinearSrgb(blue/255f)
+
+    return LMS(
+        L = cbrt(0.4122214708f * linearRed + 0.5363325363f * linearGreen + 0.0514459929f * linearBlue),
+        M = cbrt(0.2119034982f * linearRed + 0.6806995451f * linearGreen + 0.1073969566f * linearBlue),
+        S = cbrt(0.0883024619f * linearRed + 0.2817188376f * linearGreen + 0.6299787005f * linearBlue)
+    )
+}
+
+private fun LMS.toColor(alpha: Int? = null): Color {
+    val cubedL = L.pow(3)
+    val cubedM = M.pow(3)
+    val cubedS = S.pow(3)
+    return Color(
+        linearSrgbToSrgb(+4.0767416621f*cubedL - 3.3077115913f*cubedM + 0.2309699292f*cubedS).coerceIn(0f, 1f),
+        linearSrgbToSrgb(-1.2684380046f*cubedL + 2.6097574011f*cubedM - 0.3413193965f*cubedS).coerceIn(0f, 1f),
+        linearSrgbToSrgb(-0.0041960863f*cubedL - 0.7034186147f*cubedM + 1.7076147010f*cubedS).coerceIn(0f, 1f),
+        ((alpha ?: 255) / 255f).coerceIn(0f, 1f)
+    )
+}
+
+ /** Interpolates colors via the LMS space of OkLab.
+  *
+  *  Produces consistent perceived lightness and consistent hue path during interpolation compared to normal srbg interpolation.
+ **/
+fun interpolateColorNicely(from: Color, to: Color, progress: Float): Color {
+    val fromLMS = from.toLMS()
+    val toLMS = to.toLMS()
+    val targetLMS = LMS(
+        L = Misc.interpolate(fromLMS.L, toLMS.L, progress),
+        M = Misc.interpolate(fromLMS.M, toLMS.M, progress),
+        S = Misc.interpolate(fromLMS.S, toLMS.S, progress)
+    )
+    val targetAlpha = Misc.interpolate(from.alpha.toFloat(), to.alpha.toFloat(), progress).roundToInt()
+    return targetLMS.toColor(targetAlpha)
+}
+
+
+operator fun Vector2f.times(scalar: Float): Vector2f = Vector2f(this.x * scalar, this.y * scalar)
+
+inline fun Vector2f.addScaled(other: Vector2f, scale: Float) {
+    this.x += other.x * scale
+    this.y += other.y * scale
+}
+
+fun Vector2f.dot(other: Vector2f): Float {
+    return this.x * other.x + this.y * other.y
+}
+
+fun Vector2f.normalized(): Vector2f {
+    val l = this.length()
+    return if (l.isApproximatelyZero()) Vector2f(0f,0f) // Return a new zero vector
+    else Vector2f(this.x / l, this.y / l) // Return a new normalized vector
+}
+
+fun Vector2f.copy(): Vector2f = Vector2f(this.x, this.y) // Essential if ops modify in place
+
+fun Float.isApproximatelyZero(epsilon: Float = FLOAT_EPSILON): Boolean = abs(this) < epsilon
+
+const val FLOAT_EPSILON = 1e-6f
