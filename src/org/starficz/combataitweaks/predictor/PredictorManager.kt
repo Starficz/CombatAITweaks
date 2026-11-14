@@ -9,27 +9,37 @@ import com.fs.starfarer.api.combat.ViewportAPI
 import com.fs.starfarer.api.input.InputEventAPI
 import com.fs.starfarer.api.combat.BaseEveryFrameCombatPlugin
 import kotlinx.coroutines.*
-import org.lazywizard.lazylib.MathUtils
-import org.lazywizard.lazylib.ext.getFacing
 import org.lwjgl.opengl.GL11
-import org.lwjgl.util.vector.Vector2f
 import org.starficz.combataitweaks.CombatAIConfig
 import org.starficz.combataitweaks.CombatAIv2
+import org.starficz.combataitweaks.capture.captureDamage
+import org.starficz.combataitweaks.decide.MoveController
+import org.starficz.combataitweaks.decide.MoveState
+import org.starficz.combataitweaks.capture.captureMotion
+import org.starficz.combataitweaks.sim.DamageInputs
+import org.starficz.combataitweaks.sim.DamageSim
+import org.starficz.combataitweaks.sim.OwnFire
+import org.starficz.combataitweaks.sim.Coupling
+import org.starficz.combataitweaks.sim.Reactions
+import org.starficz.combataitweaks.sim.SideFire
+import org.starficz.combataitweaks.sim.SimParams
+import org.starficz.combataitweaks.sim.Timeline
+import org.starficz.combataitweaks.sim.World
 import org.starficz.combataitweaks.ui.ConfigDialog.Companion.ENABLE_CAT_AI_TAG
 import java.awt.Color
 import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.abs
 import kotlin.math.cos
-import kotlin.math.max
 import kotlin.math.sin
 import kotlin.text.removePrefix
 
 // Global Coroutine scope so we don't leak thread pools between combat engagements
 object PredictorThreadPool {
-    private val threads = max(2, Runtime.getRuntime().availableProcessors())
+    // Leave cores for the game's own threads (main loop, GC, sound): the predictor reruns as soon as it finishes, so
+    // it would otherwise keep every core busy for the whole battle.
+    private val threads = (Runtime.getRuntime().availableProcessors() - 2).coerceAtLeast(1)
     private val threadFactory = ThreadFactory { r ->
         Thread(r).apply {
             name = "Starficz-CAT-Predictor-Worker-${UUID.randomUUID().toString().take(4)}"
@@ -47,6 +57,12 @@ class PredictorManager private constructor() {
 
         private const val DATA_KEY = "CAT_PREDICTOR"
         const val FLAG_KEY = "NEEDS_CAT_PREDICTOR"
+        private const val MIN_BATCH_INTERVAL = 0.1f
+        /** Option names (plan §7); the vent decision reads HOLD and BACK_OFF. */
+        const val HOLD = "HOLD"
+        const val ADVANCE = "ADVANCE"
+        const val BACK_OFF = "BACK_OFF"
+        const val SYSTEM_SUFFIX = "+SYSTEM"
         fun getInstance(engine: CombatEngineAPI): PredictorManager {
             if (!engine.customData.containsKey(DATA_KEY)) {
                 engine.customData[DATA_KEY] = PredictorManager()
@@ -55,110 +71,38 @@ class PredictorManager private constructor() {
         }
     }
 
+    /** The damage inputs of the newest batch, for the trace recorder. */
+    @Volatile var latestDamageInputs: org.starficz.combataitweaks.sim.DamageInputs? = null
+        private set
     @Volatile private var isSimulating = false
+    /** Batches finished, their worker wall time (ms) and branches, for the battle check's throughput line. */
+    var batchesCompleted = 0
+        private set
+    var batchMillisTotal = 0L
+        private set
+    var branchesTotal = 0
+        private set
+    @Volatile private var lastBatchMillis = 0L
+    @Volatile private var lastBatchBranches = 0
+    private var lastBatchStart = -1f
     private val outputRef = AtomicReference<SimulationOutput?>(null)
 
-    private val pendingRequests = HashMap<RequestKey, Float>()
-    private var latestResults: Map<RequestKey, RequestResult> = emptyMap()
-    private var latestEnemyTimelines: Map<String, ShipTimeline> = emptyMap()
+    /** Latest options each CAT ship asked for, with when it asked. */
+    private val pendingRequests = HashMap<String, Pair<Float, List<OptionRequest>>>()
+    private var latestResults: Map<String, Map<String, RequestResult>> = emptyMap()
+    private var latestEnemyTimelines: Map<String, Timeline> = emptyMap()
 
-    private val resultTimestamps = HashMap<RequestKey, Float>()
+    private val resultTimestamps = HashMap<String, Float>()
     private val timelineTimestamps = HashMap<String, Float>()
 
-    private fun isMatch(val1: Float?, val2: Float?, tolerance: Float): Boolean {
-        if (val1 == val2) return true
-        if (val1 == null || val2 == null) return false
-        return abs(val1 - val2) <= tolerance
-    }
-
-    private fun isMobilityMatch(m1: MobilityProfile?, m2: MobilityProfile?): Boolean {
-        if (m1 == m2) return true
-        if (m1 == null || m2 == null) return false
-
-        return isMatch(m1.phase1Duration, m2.phase1Duration, 0.5f) &&
-                isMatch(m1.maxSpeedOverride1, m2.maxSpeedOverride1, 5f) &&
-                isMatch(m1.accelOverride1, m2.accelOverride1, 5f) &&
-                isMatch(m1.decelOverride1, m2.decelOverride1, 5f) &&
-                isMatch(m1.maxSpeedOverride2, m2.maxSpeedOverride2, 5f) &&
-                isMatch(m1.accelOverride2, m2.accelOverride2, 5f) &&
-                isMatch(m1.decelOverride2, m2.decelOverride2, 5f)
-    }
-
-    fun queueRequest(
-        target: ShipAPI,
-        accelDir: Vector2f,
-        mobility: MobilityProfile? = null
-    ) {
+    /** Asks for [options] to be predicted for [ship] in the next batch; replaces what it asked for before. */
+    fun request(ship: ShipAPI, options: List<OptionRequest>) {
         val engine = Global.getCombatEngine() ?: return
-        val newKey = RequestKey(target.id, accelDir, mobility)
-
-        val iterator = pendingRequests.iterator()
-        while (iterator.hasNext()) {
-            if (isNear(iterator.next().key, newKey)) {
-                iterator.remove()
-            }
-        }
-
-        pendingRequests[newKey] = engine.getTotalElapsedTime(false)
+        pendingRequests[ship.id] = engine.getTotalElapsedTime(false) to options
     }
 
-    private fun isNear(k1: RequestKey, k2: RequestKey): Boolean {
-        if (k1.shipId != k2.shipId) return false
-        if (!isMobilityMatch(k1.mobility, k2.mobility)) return false
-
-        val isZero1 = k1.accelDir.lengthSquared() == 0f
-        val isZero2 = k2.accelDir.lengthSquared() == 0f
-
-        if (isZero1 && isZero2) return true
-        if (isZero1 != isZero2) return false
-
-        val angle1 = k1.accelDir.getFacing()
-        val angle2 = k2.accelDir.getFacing()
-
-        return abs(MathUtils.getShortestRotation(angle1, angle2)) < 5f
-    }
-
-    fun getResult(
-        target: ShipAPI,
-        accelDir: Vector2f,
-        mobility: MobilityProfile? = null
-    ): DamageTimeline? {
-        val engine = Global.getCombatEngine() ?: return null
-        val currentTime = engine.getTotalElapsedTime(false)
-
-        val isZero = accelDir.lengthSquared() == 0f
-        val targetAngle = if (isZero) 0f else accelDir.getFacing()
-
-        var bestDamage: DamageTimeline? = null
-        var bestScore = Float.MAX_VALUE // Lower is better
-
-        for ((key, result) in latestResults) {
-            if (key.shipId != target.id) continue
-            if (!isMobilityMatch(key.mobility, mobility)) continue
-
-            val keyIsZero = key.accelDir.lengthSquared() == 0f
-            if (isZero != keyIsZero) continue
-
-            val angleError = if (isZero) {
-                0f
-            } else {
-                val keyAngle = key.accelDir.getFacing()
-                abs(MathUtils.getShortestRotation(targetAngle, keyAngle))
-            }
-
-            if (angleError < 10f) {
-                val age = max(0f, currentTime - result.damageTimeline.startTime)
-
-                val score = angleError + (age * 10f)
-
-                if (score < bestScore) {
-                    bestScore = score
-                    bestDamage = result.damageTimeline
-                }
-            }
-        }
-        return bestDamage
-    }
+    /** The newest predicted options of [shipId] by name (empty when there are none). */
+    fun results(shipId: String): Map<String, RequestResult> = latestResults[shipId] ?: emptyMap()
 
     fun advance(engine: CombatEngineAPI) {
         val completedOutput = outputRef.getAndSet(null)
@@ -170,7 +114,7 @@ class PredictorManager private constructor() {
                 newMap = completedOutput.results,
                 timestamps = resultTimestamps,
                 currentTime = currentTime,
-                isOverridden = { oldKey, newBatch -> newBatch.keys.any { isNear(oldKey, it) } }
+                isOverridden = { oldKey, newBatch -> newBatch.containsKey(oldKey) }
             )
 
             latestEnemyTimelines = mergeWithRetention(
@@ -181,50 +125,122 @@ class PredictorManager private constructor() {
                 isOverridden = { oldKey, newBatch -> newBatch.containsKey(oldKey) }
             )
 
+            batchesCompleted++
+            batchMillisTotal += lastBatchMillis
+            branchesTotal += lastBatchBranches
             isSimulating = false
         }
 
-        if (!isSimulating && pendingRequests.isNotEmpty()) {
-            val freshestRequests = pendingRequests.entries
-                .filter { currentTime - it.value <= 0.1f }
-                .map { it.key }
+        // plan §9: at most 10 batches a second, so faster simulation means spare CPU, not more batches
+        if (!isSimulating && pendingRequests.isNotEmpty() && currentTime - lastBatchStart >= MIN_BATCH_INTERVAL) {
+            val freshestRequests = pendingRequests.filter { currentTime - it.value.first <= 0.1f }
+                .mapValues { it.value.second }
 
             pendingRequests.clear()
 
             if (freshestRequests.isNotEmpty()) {
-                val combatState = engine.captureCombatState()
+                val aiShipIds = freshestRequests.keys
+                val snapshotTime = engine.getTotalElapsedTime(false)
+                val motion = engine.captureMotion(aiShipIds)
+                val damageInputs = engine.captureDamage(aiShipIds)
+                latestDamageInputs = damageInputs
 
                 isSimulating = true
+                lastBatchStart = currentTime
                 PredictorThreadPool.scope.launch {
+                    val started = System.nanoTime()
                     try {
-                        val baseSim = CombatSimulation(combatState)
-                        val aiShipIds = freshestRequests.map { it.shipId }.toSet()
+                        // the sim world (base once, one branch per option), then each branch's damage
+                        val world = World(motion.ships, SimParams(Constants.TOTAL_FUTURE_STATES), motion.targetingRadius,
+                            motion.ownTargetRadius)
 
-                        val validRequests = freshestRequests.filter { req ->
-                            baseSim.snapshot.ships.any { it.id == req.shipId } &&
-                                    baseSim.timelines.containsKey(req.shipId)
+                        val wanted = freshestRequests.filterKeys { id ->
+                            damageInputs.defenses.containsKey(id) && world.byId.containsKey(id)
                         }
-
-                        val deferredResults = validRequests.map { req ->
+                        // each side's fire on the enemies, on base paths: allies' part of the trade (plan §13.3)
+                        val sides = wanted.keys.mapNotNull { world.byId[it]?.owner }.toSet()
+                        val sideFire = sides.map { owner ->
+                            async { owner to SideFire.compute(owner, world.base, damageInputs) }
+                        }.awaitAll().toMap()
+                        val jobs = wanted.map { (shipId, options) ->
                             async {
-                                val branchSim = baseSim.branch()
-                                branchSim.updateShip(req.shipId, req.accelDir, req.mobility)
-                                req to branchSim.simulateDamage(req.shipId)
+                                shipId to predictOptions(world, shipId, options, damageInputs, snapshotTime,
+                                    sideFire[world.byId[shipId]!!.owner] ?: emptyMap())
                             }
                         }
 
-                        val resultsMap = deferredResults.awaitAll().toMap()
-                        val baseEnemyTimelines = baseSim.timelines.filterKeys { it !in aiShipIds }
+                        val resultsMap = jobs.awaitAll().toMap()
+                        lastBatchMillis = (System.nanoTime() - started) / 1_000_000
+                        lastBatchBranches = resultsMap.values.sumOf { it.size }
+                        val baseEnemyTimelines = world.base.filterKeys { it !in aiShipIds }
 
                         outputRef.set(SimulationOutput(baseEnemyTimelines, resultsMap))
-                    } catch (e: Exception) {
-                        Global.getLogger(this.javaClass).error("FlightPathPredictor Coroutine Error", e)
+                    } catch (e: Throwable) {
+                        // Throwable, not Exception: an Error (NoClassDefFoundError, StackOverflowError...) used to
+                        // escape here and leave isSimulating stuck at true, silently killing the predictor.
+                        Global.getLogger(PredictorManager::class.java).error("CAT predictor simulation failed", e)
                         isSimulating = false
                     }
                 }
             }
         }
     }
+
+    /**
+     * One CAT ship's options. Movement is simulated for every option; the damage only once when no enemy commits
+     * to the ship (plan §9 budget): then nothing re-plans around its path, and every option reads the hold
+     * branch's damage.
+     *
+     * When the ship's fire makes committed enemies back off or overload (plan §13.8), the branch runs a second time
+     * with those reactions. The vent-now outcome stays the first run's: the ship doesn't fire while venting.
+     */
+    private suspend fun predictOptions(
+        world: World, shipId: String, options: List<OptionRequest>, inputs: DamageInputs, snapshotTime: Float,
+        sideHits: Map<String, List<org.starficz.combataitweaks.sim.Hit>>,
+    ): Map<String, RequestResult> = coroutineScope {
+        val ship = world.byId[shipId]!!
+        val owner = ship.owner
+        val own = OwnFire(ship.maneuverTargetId, resolveTargets = true, sideHits = sideHits)
+        val branches = options.map { it to world.branch(shipId, it.plan) }
+        val quiet = branches.all { it.second.committed.isEmpty() }
+        val shared = if (quiet) {
+            val hold = branches.firstOrNull { it.first.name == HOLD } ?: branches.first()
+            DamageSim.run(shipId, owner, hold.second.timelines, inputs, withVent = branches.any { it.first.withVent },
+                own)
+        } else null
+        branches.map { (req, branch) ->
+            async {
+                var final = branch
+                var damage = if (quiet) shared
+                             else DamageSim.run(shipId, owner, branch.timelines, inputs, req.withVent, own)
+                val coupling = if (quiet || damage == null) Coupling.NONE
+                               else Reactions.find(world, shipId, branch.committed.keys, damage)
+                if (!coupling.isEmpty()) {
+                    final = if (coupling.reactions.isEmpty()) branch
+                            else world.branch(shipId, req.plan, coupling.reactions)
+                    val again = DamageSim.run(shipId, owner, final.timelines, inputs, false, own, coupling)
+                    if (again != null) damage = again.withVentNow(damage!!.ventNow)
+                }
+                RequestResult(
+                    name = req.name,
+                    plan = req.plan,
+                    outlook = DamageOutlook(snapshotTime, damage),
+                    shipTimeline = final.timelines[shipId]!!,
+                    committed = final.committed,
+                    pursuitTimelines = final.committed.keys.associateWith { final.timelines[it]!! },
+                    approachRange = final.approachRange,
+                    clearRange = final.clearRange,
+                    reactions = coupling.reactions,
+                )
+            }
+        }.awaitAll().associateBy { it.name }
+    }
+
+    /** Newest hold-position result for [shipId], or null. For the overlay, debugging tools and the battle check. */
+    fun latestHoldResult(shipId: String): RequestResult? = latestResults[shipId]?.get(HOLD)
+
+    /** Base-world path (current plan, then coast) of a non-CAT ship from the latest batch, or null. */
+    fun latestBaseTimeline(shipId: String): Timeline? = latestEnemyTimelines[shipId]
 
     private inline fun <K, V> mergeWithRetention(
         oldMap: Map<K, V>,
@@ -265,85 +281,85 @@ class PredictorManager private constructor() {
 
         for ((shipId, timeline) in latestEnemyTimelines) {
             val ship = shipMap[shipId] ?: continue
-            if (ship.isStationModule || !viewport.isNearViewport(ship.location, 2000f)) continue
+            if (ship.isStationModule || ship.isFighter || !viewport.isNearViewport(ship.location, 2000f)) continue
             GL11.glColor4f(0.6f, 0.6f, 0.6f, 0.3f)
             drawTimeline(timeline)
         }
 
-        val maxStart = latestResults.values.maxOfOrNull { it.damageTimeline.startTime } ?: 0f
-
         val drawnShips = HashSet<String>()
-        for ((key, result) in latestResults) {
-            if (result.damageTimeline.startTime + 0.1f < maxStart) continue
-            val ship = shipMap[key.shipId] ?: continue
+        for ((shipId, options) in latestResults) {
+            val ship = shipMap[shipId] ?: continue
             if (ship.isStationModule || !viewport.isNearViewport(ship.location, 2000f)) continue
+            drawnShips.add(shipId)
+            val driven = ship.customData[MoveController.OPTION] as? String
 
-            drawnShips.add(key.shipId)
+            for ((name, result) in options) {
+                // heat colour: flux the shield would take over the horizon (hull lost for shieldless ships)
+                val normal = result.outlook.result?.normal
+                val dangerRatio = when {
+                    normal == null -> 0f
+                    ship.shield != null && ship.shield.type != ShieldAPI.ShieldType.NONE ->
+                        normal.potentialFlux[normal.steps - 1] / ship.maxFlux.coerceAtLeast(1f)
+                    else -> normal.hullLost[normal.steps - 1] / ship.maxHitpoints.coerceAtLeast(1f)
+                }
+                val hue = 0.55f * (1f - dangerRatio.coerceIn(0f, 1f))
+                val heatmapColor = Color.getHSBColor(hue, 1f, 1f)
+                GL11.glColor4f(heatmapColor.red / 255f, heatmapColor.green / 255f, heatmapColor.blue / 255f,
+                    if (name == driven) 0.9f else 0.35f)
+                drawTimeline(result.shipTimeline, if (name == driven) 3f else 1.5f)
 
-            val damageTimeline = result.damageTimeline
-
-            val fluxGained = if (ship.shield != null && ship.shield.type != ShieldAPI.ShieldType.NONE) {
-                damageTimeline.fluxToShield(
-                    engine.getTotalElapsedTime(false),
-                    Constants.PREDICTION_DURATION,
-                    ship, useModifiedShieldMult = true)
-            } else {
-                damageTimeline.damageInstances.sumOf { inst ->
-                    val mult = when (inst.type) {
-                        com.fs.starfarer.api.combat.DamageType.KINETIC -> 0.5f
-                        com.fs.starfarer.api.combat.DamageType.HIGH_EXPLOSIVE -> 2.0f
-                        com.fs.starfarer.api.combat.DamageType.ENERGY -> 1.0f
-                        com.fs.starfarer.api.combat.DamageType.FRAGMENTATION -> 0.25f
-                        else -> 1.0f
+                // the hold-position branch shows the enemy plan: each committed enemy's pursuit path (red) and the
+                // ring at the range it closes to (faint red, around the ship's current position)
+                if (name != HOLD) continue
+                for ((enemyId, path) in result.pursuitTimelines) {
+                    val enemy = shipMap[enemyId] ?: continue
+                    GL11.glColor4f(1f, 0.15f, 0.1f, if (enemy.isFighter) 0.35f else 0.8f)
+                    drawTimeline(path)
+                    if (!enemy.isFighter) {
+                        GL11.glColor4f(1f, 0.15f, 0.1f, 0.25f)
+                        GL11.glLineWidth(1f)
+                        drawCircle(ship.location.x, ship.location.y, result.committed[enemyId] ?: continue)
                     }
-                    (inst.amount * mult * 10f).toDouble()
-                }.toFloat()
+                }
             }
-
-            val dangerRatio = fluxGained / ship.maxFlux.coerceAtLeast(1f)
-            val clampedDanger = dangerRatio.coerceIn(0f, 1f)
-            val hue = 0.55f * (1f - clampedDanger)
-            val heatmapColor = Color.getHSBColor(hue, 1f, 1f)
-
-            GL11.glColor4f(heatmapColor.red / 255f, heatmapColor.green / 255f, heatmapColor.blue / 255f, 0.8f)
-            drawTimeline(result.shipTimeline)
         }
 
         GL11.glLineWidth(4f)
         for (shipId in drawnShips) {
             val ship = shipMap[shipId] ?: continue
-            val behaviorState = ship.customData[CombatAIv2.BEHAVIOR_STATE] as? CombatAIv2.BehaviorState ?: continue
-
-            when (behaviorState) {
-                CombatAIv2.BehaviorState.ADVANCE -> GL11.glColor4f(0f, 1f, 0f, 0.8f)
-                CombatAIv2.BehaviorState.STANDOFF  -> GL11.glColor4f(0.5f, 1f, 0f, 0.8f)
-                CombatAIv2.BehaviorState.BACKOFF  -> GL11.glColor4f(1f, 0.5f, 0f, 0.8f)
-                CombatAIv2.BehaviorState.DISENGAGE  -> GL11.glColor4f(1f, 0f, 0f, 0.8f)
-                CombatAIv2.BehaviorState.VENTING  -> GL11.glColor4f(1f, 1f, 1f, 0.8f)
+            when (ship.customData[CombatAIv2.BEHAVIOR_STATE] as? String) {
+                MoveState.ADVANCE.name -> GL11.glColor4f(0f, 1f, 0f, 0.8f)
+                MoveState.HOLD.name -> GL11.glColor4f(0.5f, 1f, 0f, 0.8f)
+                MoveState.BACK_OFF.name -> GL11.glColor4f(1f, 0.5f, 0f, 0.8f)
+                MoveState.DISENGAGE.name -> GL11.glColor4f(1f, 0f, 0f, 0.8f)
+                MoveState.VENTING.name -> GL11.glColor4f(1f, 1f, 1f, 0.8f)
+                else -> continue
             }
-
-            GL11.glBegin(GL11.GL_LINE_LOOP)
-            val radius = ship.collisionRadius * 1.2f
-            for (i in 0 until 32) {
-                val theta = 2.0 * Math.PI * i / 32
-                GL11.glVertex2f(ship.location.x + (radius * cos(theta)).toFloat(), ship.location.y + (radius * sin(theta)).toFloat())
-            }
-            GL11.glEnd()
+            drawCircle(ship.location.x, ship.location.y, ship.collisionRadius * 1.2f)
         }
         GL11.glPopAttrib()
     }
 
-    private fun drawTimeline(timeline: ShipTimeline) {
-        GL11.glLineWidth(2f)
+    private fun drawCircle(cx: Float, cy: Float, radius: Float, segments: Int = 64) {
+        GL11.glBegin(GL11.GL_LINE_LOOP)
+        for (i in 0 until segments) {
+            val theta = 2.0 * Math.PI * i / segments
+            GL11.glVertex2f(cx + (radius * cos(theta)).toFloat(), cy + (radius * sin(theta)).toFloat())
+        }
+        GL11.glEnd()
+    }
+
+    private fun drawTimeline(timeline: Timeline, width: Float = 2f) {
+        GL11.glLineWidth(width)
         GL11.glBegin(GL11.GL_LINE_STRIP)
-        for (i in 0 until timeline.size) {
+        for (i in 0 until timeline.steps) {
             GL11.glVertex2f(timeline.x[i], timeline.y[i])
         }
         GL11.glEnd()
 
         GL11.glBegin(GL11.GL_LINES)
-        for (i in 0 until timeline.size step 20) {
-            val facingRad = Math.toRadians(timeline.facings[i].toDouble())
+        for (i in 0 until timeline.steps step 20) {
+            val facingRad = Math.toRadians(timeline.facing[i].toDouble())
             val p2x = timeline.x[i] + (50f * cos(facingRad)).toFloat()
             val p2y = timeline.y[i] + (50f * sin(facingRad)).toFloat()
             GL11.glVertex2f(timeline.x[i], timeline.y[i])
@@ -358,26 +374,41 @@ class CATCombatPlugin : BaseEveryFrameCombatPlugin() {
     override fun advance(amount: Float, events: List<InputEventAPI>?) {
         val engine = Global.getCombatEngine() ?: return
 
-        for(ship in engine.ships){
-            if (ship.variant.hasTag(ENABLE_CAT_AI_TAG)){
-                val existingTag = ship.variant.tags.find { it.startsWith(CombatAIConfig.TAG_PREFIX) }
-                val currentConfig = if (existingTag != null) {
-                    CombatAIConfig.fromJsonString(existingTag.removePrefix(CombatAIConfig.TAG_PREFIX))
-                } else CombatAIConfig()
-                if (!ship.hasListenerOfClass(CombatAIv2::class.java)) ship.addListener(CombatAIv2(ship, currentConfig))
-            }
+        for (ship in engine.ships) {
+            if (ship.isFighter || ship.isHulk || !ship.isAlive) continue
+            if (ship.hasListenerOfClass(CombatAIv2::class.java)) continue
+            if (!wantsCatAI(ship)) continue
+
+            val existingTag = ship.variant.tags.find { it.startsWith(CombatAIConfig.TAG_PREFIX) }
+            val currentConfig = if (existingTag != null) {
+                CombatAIConfig.fromJsonString(existingTag.removePrefix(CombatAIConfig.TAG_PREFIX))
+            } else CombatAIConfig()
+            ship.addListener(CombatAIv2(ship, currentConfig))
         }
 
         if (engine.isPaused) return
         if (engine.customData[PredictorManager.FLAG_KEY] != true) return
 
         PredictorManager.getInstance(engine).advance(engine)
+        // battle trace for offline analysis (dev mode or -Dcat.trace=true)
+        org.starficz.combataitweaks.runtime.TraceRecorder.get(engine)?.advance(engine)
     }
 
-//    override fun renderInWorldCoords(viewport: ViewportAPI) {
-//        val engine = Global.getCombatEngine() ?: return
-//        if (engine.customData[PredictorManager.FLAG_KEY] != true) return
-//
-//        PredictorManager.getInstance(engine).renderDebug(viewport)
-//    }
+    /**
+     * Ships enabled in the refit dialog, plus every SCY hull: the config dialog says those must use this AI, but
+     * before, only SCY ships the player had opened and saved in the dialog got it (and no NPC ones).
+     */
+    private fun wantsCatAI(ship: ShipAPI): Boolean {
+        if (ship.hullSpec.isPhase) return false
+        return ship.variant.hasTag(ENABLE_CAT_AI_TAG) || ship.hullSpec.sourceMod?.id == "SCY"
+    }
+
+    // Dev mode only: predicted paths (heat-coloured by incoming flux) and a ring showing each ship's behaviour state.
+    override fun renderInWorldCoords(viewport: ViewportAPI) {
+        if (!Global.getSettings().isDevMode) return
+        val engine = Global.getCombatEngine() ?: return
+        if (engine.customData[PredictorManager.FLAG_KEY] != true) return
+
+        PredictorManager.getInstance(engine).renderDebug(viewport)
+    }
 }

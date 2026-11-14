@@ -51,9 +51,11 @@ fun isPointWithinMap(point: Vector2f, pad: Float): Boolean {
 fun getBackingOffStrafePoint(ship: ShipAPI): Vector2f? {
     val secondsInFuture = 1f
     val degreeDelta = 5f
-    val futureLocation = Vector2f()
-    Vector2f.add(ship.location, ship.velocity, futureLocation)
-    futureLocation.scale(secondsInFuture)
+    // location + velocity * t (scaling the sum was only correct for t = 1)
+    val futureLocation = Vector2f(
+        ship.location.x + ship.velocity.x * secondsInFuture,
+        ship.location.y + ship.velocity.y * secondsInFuture
+    )
     var potentialPoints =
         MathUtils.getPointsAlongCircumference(futureLocation, 1000f, (360f / degreeDelta).toInt(), 0f)
     val filterBorder: CollectionFilter<Vector2f?> =
