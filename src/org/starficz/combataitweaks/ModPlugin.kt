@@ -1,12 +1,6 @@
 package org.starficz.combataitweaks
 
 import com.fs.starfarer.api.BaseModPlugin
-import org.starficz.combataitweaks.ui.RefitButton
-import org.starficz.staruiframework.*
 
-class ModPlugin : BaseModPlugin()  {
-    override fun onApplicationLoad() {
-        StarUIManager.registerDynamicInjection(RefitButton())
-
-    }
-}
+// The refit's "AI Config" button needs no registration: ui/RefitButton.kt is a PatchLib patch, found in this jar.
+class ModPlugin : BaseModPlugin()
