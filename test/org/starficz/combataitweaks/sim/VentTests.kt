@@ -32,6 +32,12 @@ internal fun ventRule() {
     check(backOffSafe.vent && backOffSafe.safe && backOffSafe.option?.name == "BACK_OFF",
         "vent: safe only while backing off -> vents backing off") { backOffSafe.reason }
 
+    // the safe margin: 90 of a 100 armor limit is within the limit but not safe (80% of it), 75 is
+    val nearLimit = VentRule.decide(inputs(opt("HOLD", ventArmor = 90f)))
+    check(!nearLimit.vent, "vent: within the limit but not its 80% margin -> doesn't vent") { nearLimit.reason }
+    val inMargin = VentRule.decide(inputs(opt("HOLD", ventArmor = 75f)))
+    check(inMargin.vent && inMargin.safe, "vent: within the 80% margin -> safe") { inMargin.reason }
+
     val torpedo = VentRule.decide(inputs(opt("HOLD", ventArmor = 400f, ventHull = 2000f), opt("BACK_OFF", ventArmor = 300f, ventHull = 1500f)))
     check(!torpedo.vent, "vent: a big hit while venting and none when staying -> doesn't vent") { torpedo.reason }
 

@@ -1154,6 +1154,24 @@ Noted 2026-11-14 at the user's request; not planned yet.
   - a Lasher vented at 28 of its 30 armor limit and lost 61 to a Shrike's beams.
   - Next: model burst beams' charge-up and charge-down damage (vanilla scales beam damage by its brightness;
     **(verify)** the curve in the beam code), and capture beams still fading at the snapshot.
+  - **Built 2026-11-15.** How vanilla does it (translation of obfuscated code: `BeamWeaponRay.advance`, the beam
+    weapon tracker `trackers.String`):
+    - each frame adds brightness² × frame time (ship time) to an accumulator;
+    - every 0.1 s or more the ray deals one tick: the damage multiplier is the accumulator over the elapsed time,
+      dpsDuration is the elapsed time, and the ship's damage bonuses are applied as modifiers;
+    - a burst beam's last fade tick also gets b² / 4 × charge-down;
+    - brightness ramps linearly over the charge-up, holds for the burst, and ramps down over the charge-down;
+    - a burst beam's `getCooldown()` is charge-down + burst cooldown;
+    - `getChargeLevel()` is not the brightness while fading; `BeamAPI.getBrightness()` is.
+
+    So each ramp is worth a third of its length at full power. The capture adds (charge-up + charge-down) / 3 to
+    the burst, taken out of the charge-up wait and the cooldown: the same cycle, the same sustained DPS. A burst
+    beam fading at the snapshot fires on for b³ × charge-down / 3. Continuous beams are unchanged: the sim fires
+    them whenever they can engage, ramps ignored.
+  - **Vent margin:** a safe vent must predict at most 80% of the limits (`VentRule.SAFE_MARGIN`). The audit still
+    judges against the full limits.
+  - **Checked:** unit tests 282 (the margin); `ventcases` 12/12; two `aibattle` runs 14/14 with 5 vents, none over.
+    The fading-beam case didn't recur in those battles.
 - **Vent pursuit** (found 2026-11-14 in `aibattle`): a Hound vented "safe" (predicted 2 armor, 27 hull) and took
   69 armor and 350 hull, two 500-damage energy hits from a Shrike that caught it while it backed off venting. The vent
   prediction has no PD by design, so it's the back-off-while-venting path or the pursuit model.

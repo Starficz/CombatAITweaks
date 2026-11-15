@@ -48,13 +48,20 @@ class VentChoice(
 
 /**
  * The vent decision (plan §8.1). Vent when the best way to vent is either
- * - **safe**: armor lost in the window within maxArmorDamageLevelToVent x armor rating and hull lost within
- *   maxHullDamageLevelToVent x hitpoints (no hull loss at all below stopVentingBelowHullLevel), or
+ * - **safe**: armor lost in the window within [SAFE_MARGIN] x maxArmorDamageLevelToVent x armor rating and hull lost
+ *   within [SAFE_MARGIN] x maxHullDamageLevelToVent x hitpoints (no hull loss at all below stopVentingBelowHullLevel),
+ *   or
  * - **better than staying**: it loses at most [BETTER_FACTOR] x what the best option without venting loses in the
  *   same window, and hull is above stopVentingBelowHullLevel.
  */
 object VentRule {
     const val BETTER_FACTOR = 0.8f
+    /**
+     * A safe vent must predict at most this share of the limits: a vent can't be undone, and beams (semi-continuous,
+     * modelled as 0.1 s ticks) are the least precise part of the prediction. Added after two aibattle vents at 28/30
+     * and 0/30 armor lost 61 and 199 (plan §14, beam ramps). The audit still judges against the full limits.
+     */
+    const val SAFE_MARGIN = 0.8f
     /** Cost weights (plan §8.2): hull counts triple. */
     const val HULL_WEIGHT = 3f
     /** Hull loss treated as none: a stray fragment shouldn't forbid a vent. */
@@ -82,7 +89,7 @@ object VentRule {
             if (bestStay.stayOverloadsIn >= 0f) ", stay overloads in %.1fs".format(bestStay.stayOverloadsIn) else "")
 
         // safe: the safe way to vent that loses least
-        val safeOptions = i.options.filter { it.ventArmor <= armorLimit && it.ventHull <= hullLimit }
+        val safeOptions = i.options.filter { it.ventArmor <= armorLimit * SAFE_MARGIN && it.ventHull <= hullLimit * SAFE_MARGIN }
         if (safeOptions.isNotEmpty()) {
             val pick = safeOptions.minBy { it.ventCost }
             return VentChoice(true, true, pick, "VENT safe ($numbers)", i.window, armorLimit, hullLimit)

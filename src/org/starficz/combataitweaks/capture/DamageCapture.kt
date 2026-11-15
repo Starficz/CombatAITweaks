@@ -264,13 +264,24 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
     val rof = if (specRefire > 0f && w.refireDelay > 0f) w.refireDelay / specRefire else 1f
     val burst = if (w.isBeam) 1 else spec.burstSize.coerceAtLeast(1)
     val burstDelay = (projSpec?.burstDelay ?: 0f) * rof
-    val chargeUp = if (w.isBeam) beamSpec?.chargeupTime ?: 0f else spec.chargeTime
+    // Burst beams ramp (translation of obfuscated code: the beam weapon tracker and BeamWeaponRay): brightness goes
+    // 0 -> 1 linearly over the charge-up, holds for the burst, then 1 -> 0 over the charge-down, and damage scales
+    // with brightness squared, so each ramp is worth a third of its length at full power. The sim fires at full power
+    // only, so a burst gets that third of both ramps as full-power time, taken out of the charge-up wait and the
+    // cooldown (vanilla's getCooldown() is charge-down + burst cooldown): the same cycle, the same sustained DPS.
+    val rampUp = if (w.isBurstBeam) beamSpec?.chargeupTime ?: 0f else 0f
+    val rampDown = if (w.isBurstBeam) beamSpec?.chargedownTime ?: 0f else 0f
+    val chargeUp = when {
+        w.isBurstBeam -> rampUp * 2f / 3f
+        w.isBeam -> beamSpec?.chargeupTime ?: 0f
+        else -> spec.chargeTime
+    }
     val cooldown = when (mode) {
         FireMode.BEAM -> 0f
-        FireMode.BURST_BEAM -> w.cooldown
+        FireMode.BURST_BEAM -> (w.cooldown - rampDown / 3f).coerceAtLeast(0f)
         else -> w.refireDelay
     }
-    val burstDuration = if (w.isBurstBeam) beamSpec?.burstDuration ?: 1f else 0f
+    val burstDuration = if (w.isBurstBeam) (beamSpec?.burstDuration ?: 1f) + (rampUp + rampDown) / 3f else 0f
 
     // state now, in this ship's time
     var phase = WeaponPhase.READY
@@ -278,9 +289,20 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
     var shotsLeft = 0
     when {
         w.isBeam && !w.isBurstBeam -> if (w.isFiring) phase = WeaponPhase.FIRING
-        w.isBurstBeam -> when {
-            w.isFiring && w.burstFireTimeRemaining > 0f -> { phase = WeaponPhase.FIRING; timeLeft = w.burstFireTimeRemaining }
-            w.cooldownRemaining > 0f -> { phase = WeaponPhase.COOLDOWN; timeLeft = w.cooldownRemaining }
+        w.isBurstBeam -> {
+            // a beam fading out: what is left of its ramp, brightness b falling to 0 over b x charge-down at
+            // brightness squared, is b^3 x charge-down / 3 at full power (getChargeLevel() isn't the brightness
+            // there; the live beam's is)
+            val fading = w.beams?.maxOfOrNull { it.brightness } ?: 0f
+            when {
+                w.isFiring && w.burstFireTimeRemaining > 0f -> {
+                    phase = WeaponPhase.FIRING; timeLeft = w.burstFireTimeRemaining + rampDown / 3f
+                }
+                fading > 0.01f && rampDown > 0f -> {
+                    phase = WeaponPhase.FIRING; timeLeft = fading * fading * fading * rampDown / 3f
+                }
+                w.cooldownRemaining > 0f -> { phase = WeaponPhase.COOLDOWN; timeLeft = w.cooldownRemaining }
+            }
         }
         w.isInBurst -> {
             phase = WeaponPhase.FIRING
