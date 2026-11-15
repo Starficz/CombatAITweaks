@@ -200,7 +200,7 @@ object DamageSim {
     ): List<FireControl> {
         val shooter = inputs.shooterById[protectedId] ?: return emptyList()
         if (shooter.weapons.isEmpty()) return emptyList()
-        val reach = shooter.weapons.maxOf { it.range } + REACH_PAD
+        val reach = shooter.maxRange + REACH_PAD
         val result = ArrayList<FireControl>()
         for ((id, def) in inputs.defenses) {
             if (id == protectedId || def.owner == owner) continue

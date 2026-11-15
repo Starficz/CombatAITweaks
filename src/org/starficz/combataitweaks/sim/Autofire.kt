@@ -47,14 +47,13 @@ class Volley(
     private fun retarget(i: Int) {
         val sx = timeline.x[i]; val sy = timeline.y[i]; val sf = timeline.facing[i]
         for (k in weapons.indices) {
-            val w = weapons[k]
-            if (shipTarget >= 0 && fits(w, targets[shipTarget], i, sx, sy, sf) >= 0f) { current[k] = shipTarget; continue }
+            if (shipTarget >= 0 && fits(k, targets[shipTarget], i, sx, sy, sf) >= 0f) { current[k] = shipTarget; continue }
             val cur = current[k]
-            if (cur >= 0 && fits(w, targets[cur], i, sx, sy, sf) >= 0f) continue
+            if (cur >= 0 && fits(k, targets[cur], i, sx, sy, sf) >= 0f) continue
             var best = -1
             var bestTurn = Float.MAX_VALUE
             for (t in targets.indices) {
-                val bearing = fits(w, targets[t], i, sx, sy, sf)
+                val bearing = fits(k, targets[t], i, sx, sy, sf)
                 if (bearing < 0f) continue
                 val turn = abs(shortestRotation(gunnery.angle(k), bearing - 360f))
                 if (turn < bestTurn) { bestTurn = turn; best = t }
@@ -64,15 +63,16 @@ class Volley(
     }
 
     /**
-     * Whether weapon [w] can engage [t] at step [i]: in range (range + the target's radius) and arc. Returns the
+     * Whether weapon [k] can engage [t] at step [i]: in range (its range now, + the target's radius) and arc. Returns the
      * ship-local bearing to it + 360 (so always >= 0), or -1 when it can't.
      */
-    private fun fits(w: SimWeapon, t: FireControl, i: Int, sx: Float, sy: Float, sf: Float): Float {
+    private fun fits(k: Int, t: FireControl, i: Int, sx: Float, sy: Float, sf: Float): Float {
+        val w = weapons[k]
         if (w.strike && !w.vsFrigates && t.target.hullClass == HullClass.FRIGATE) return -1f
         val dx = t.targetTimeline.x[i] - sx; val dy = t.targetTimeline.y[i] - sy
         val dist = sqrt(dx * dx + dy * dy)
         val r = t.target.hitRadius
-        if (dist > w.range + r) return -1f
+        if (dist > gunnery.range(k) + r) return -1f
         val local = shortestRotation(sf, angleOf(dx, dy))
         if (!w.noAim) {
             val angularRadius = if (dist > r) asin(r / dist) * RAD_TO_DEG else 90f

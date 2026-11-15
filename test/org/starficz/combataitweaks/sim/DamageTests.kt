@@ -58,7 +58,7 @@ private fun gun(
     damage: Float = 100f, range: Float = 800f, arc: Float = 30f, cooldown: Float = 1f, burst: Int = 1,
     burstDelay: Float = 0.1f, fluxCost: Float = 0f, ammo: Int = -1, mode: FireMode = FireMode.PROJECTILE,
     speed: Float = 1000f, chargeUp: Float = 0f, burstDuration: Float = 0f, conservative: Boolean = false,
-    missile: MissileInfo? = null, noAim: Boolean = false,
+    missile: MissileInfo? = null, noAim: Boolean = false, boost: WeaponBoost? = null,
 ) = SimWeapon(
     mountX = 0f, mountY = 0f, slotAngle = 0f, arc = arc, turnRate = 90f, angle = 0f, range = range, mode = mode,
     damage = damage, emp = 0f, kind = DamageKind.ENERGY, softFlux = mode != FireMode.PROJECTILE && missile == null,
@@ -66,12 +66,13 @@ private fun gun(
     cooldown = cooldown, fluxCost = fluxCost, phase = WeaponPhase.READY, phaseTimeLeft = 0f, shotsLeftInBurst = 0,
     disabledFor = 0f, ammo = ammo, maxAmmo = ammo.coerceAtLeast(0), ammoPerSecond = 0f, reloadSize = 0f,
     speed = speed, spread = 0f, conservative = conservative, noAim = noAim, missile = missile, sustainedDps = damage,
+    boost = boost,
 )
 
 private fun shooter(
     vararg weapons: SimWeapon, flux: Float = 0f, maxFlux: Float = 10000f, dissipation: Float = 100f,
-    silence: Float = 0f, id: String = "E",
-) = SimShooter(id, 1, flux, 0f, maxFlux, dissipation, 1f, silence, FloatArray(6) { 1f }, weapons.toList())
+    silence: Float = 0f, id: String = "E", system: ShooterSystem? = null,
+) = SimShooter(id, 1, flux, 0f, maxFlux, dissipation, 1f, silence, FloatArray(6) { 1f }, weapons.toList(), system = system)
 
 /** Fires one shooter sitting at (x, 0) facing the protected ship at the origin, for [steps] steps. */
 private fun fireAt(s: SimShooter, x: Float = 600f, steps: Int = 400, def: SimDefense = defense()): FireControl {
@@ -150,6 +151,79 @@ internal fun damage() {
     tradeScenarios()
     ventPursuit()
     demPayload()
+    systemBoosts()
+}
+
+/**
+ * Ship systems that boost their ship's weapons (plan §11b), an Accelerated Ammo Feeder-like one: fire rate x2 and flux
+ * cost x0.5 for 7 s (1 s charge-up, 5 s active, 1 s charge-down, all counted at full), then 10 s cooldown. One gun
+ * (100 damage, 1 s cooldown) 600 from a still target for 20 s: 21 shots without the system (at 0 s and every second
+ * after). An enemy uses it at once
+ * (2 shots a second until 7 s: 14), again at 17 s (6 more), and fires plainly in between (10): 30.
+ */
+private fun systemBoosts() {
+    val feeder = WeaponBoost(rof = 2f, flux = 0.5f)
+    fun aaf(onLeft: Float = 0f, readyIn: Float = 0f, charges: Int = Int.MAX_VALUE, cooldown: Float = 10f,
+            onTime: Float = 7f, regen: Float = 0f) =
+        ShooterSystem(onLeft = onLeft, chargeDown = 1f, onTime = onTime, cooldown = cooldown, readyIn = readyIn,
+            charges = charges, maxCharges = if (charges == Int.MAX_VALUE) charges else 3, regen = regen)
+    fun shots(fc: FireControl, until: Float = 99f) = fc.hits.count { it.time < until }
+
+    near(shots(fireAt(shooter(gun()))).toFloat(), 21f, 0.5f, "system boost: 21 shots without a system")
+    val used = fireAt(shooter(gun(boost = feeder), system = aaf()))
+    near(shots(used, 7f).toFloat(), 14f, 1f, "system boost: an enemy uses it at once: twice the fire rate while on")
+    near(shots(used).toFloat(), 30f, 1.5f, "system boost: then plain fire through its cooldown, and again at 17 s")
+    near(shots(fireAt(shooter(gun(boost = feeder), system = aaf(readyIn = 5f)))).toFloat(), 27.5f, 1.5f,
+        "system boost: waits until it is ready (5 plain to 5 s, 14 boosted to 12 s, then about 8 plain)")
+    near(shots(fireAt(shooter(gun(boost = feeder), system = aaf(charges = 1, cooldown = 0f)))).toFloat(), 27f, 1.5f,
+        "system boost: no more uses than its charges (14 boosted, then 13 plain)")
+    near(shots(fireAt(shooter(gun(boost = feeder), system = aaf(charges = 0, cooldown = 0f, regen = 0.1f)))).toFloat(),
+        27f, 1.5f, "system boost: a charge regenerating (0.1/s) is used once back, at 10 s (10 plain, 14 boosted, 3 plain)")
+    near(shots(fireAt(shooter(gun(), system = aaf()))).toFloat(), 21f, 0.5f,
+        "system boost: a system that boosts none of the weapons changes nothing")
+
+    // the protected ship's own fire (autofire, Volley): vanilla decides its system, so only a use already on counts,
+    // without its charge-down: on 3 s at the snapshot, 1 s of it charge-down: 2 s boosted (4 shots), then 18 plain
+    fun volley(sys: ShooterSystem): Int {
+        val fc = FireControl(defense(id = "T", owner = 1), 1, still(400))
+        val s = SimShooter("P", 0, 0f, 0f, 10000f, 100f, 1f, 0f, FloatArray(6) { 1f }, listOf(gun(boost = feeder)),
+            system = sys)
+        val tl = still(400, x = 600f, facing = 180f)
+        val v = Volley(s, tl, listOf(fc), 0)
+        val gate = ShooterFlux(s)
+        for (i in 0 until 400) { gate.tick(i); v.step(i, gate) }
+        return fc.hits.size
+    }
+    near(volley(aaf()).toFloat(), 21f, 0.5f, "system boost: own fire doesn't count on using the system")
+    near(volley(aaf(onLeft = 3f, readyIn = 13f)).toFloat(), 22f, 1f, "system boost: own fire counts a use already on")
+
+    // flux: 100 per shot on 1000 max flux, no dissipation: 10 shots plain, 20 with the cost halved (a toggle: always on)
+    val toggle = aaf(onTime = Float.MAX_VALUE)
+    near(shots(fireAt(shooter(gun(fluxCost = 100f), maxFlux = 1000f, dissipation = 0f))).toFloat(), 10f, 0.5f,
+        "system boost: 10 shots on the flux plainly")
+    near(shots(fireAt(shooter(gun(fluxCost = 100f, boost = feeder), maxFlux = 1000f, dissipation = 0f, system = toggle)))
+        .toFloat(), 20f, 0.5f, "system boost: twice the shots on half the flux cost")
+
+    // vanilla's minRefireDelay: a Heavy Needler-like burst (10 shots 0.05 s apart, 4 s cooldown) keeps its burst rate
+    // under x2 fire rate (0.025 s would be under the 0.05 s floor) and only its cooldown halves
+    near(refireDelay(0.05f, 2f), 0.05f, 1e-6f, "fire rate: a delay at the floor isn't sped up")
+    near(refireDelay(0.08f, 2f), 0.05f, 1e-6f, "fire rate: a delay is sped up to the floor at most")
+    near(refireDelay(4f, 2f), 2f, 1e-6f, "fire rate: a longer delay is divided by the fire rate")
+    near(refireDelay(1f, 0.5f), 2f, 1e-6f, "fire rate: a fire rate under 1 always slows it")
+    val needler = fireAt(shooter(gun(damage = 50f, burst = 10, burstDelay = 0.05f, cooldown = 4f, boost = feeder),
+        system = toggle), steps = 160)
+    val firstBurst = needler.hits.sortedBy { it.time }.take(10)
+    near(firstBurst.last().time - firstBurst.first().time, 0.45f, 0.01f, "fire rate: the burst keeps its 0.05 s spacing")
+    // bursts start every 0.45 s burst + 2 s cooldown: 0, 2.45, 4.9 and 7.35 s within 8 s (plainly 0 and 4.45 s)
+    near(needler.hits.size.toFloat(), 40f, 0.5f, "fire rate: only the cooldown halves (4 bursts in 8 s, not 2)")
+
+    // damage, and range: a 500-range gun can't reach a target 600 away (550 with its radius) without the boost
+    val hef = fireAt(shooter(gun(boost = WeaponBoost(damage = 1.5f)), system = toggle))
+    check(hef.hits.isNotEmpty() && hef.hits.all { abs(it.damage - 150f) < 0.01f }, "system boost: damage x1.5 per hit")
+    check(fireAt(shooter(gun(range = 500f, boost = WeaponBoost(range = 1.2f)))).hits.isEmpty(),
+        "system boost: no shots out of range without its system")
+    check(fireAt(shooter(gun(range = 500f, boost = WeaponBoost(range = 1.2f)), system = aaf())).hits.isNotEmpty(),
+        "system boost: a range boost puts a target in reach, and the enemy uses it for that")
 }
 
 /**

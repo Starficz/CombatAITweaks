@@ -146,10 +146,10 @@ class FireControl(
         pressure: FloatArray? = null, recordFlux: Boolean = true,
     ) {
         if (shooter.owner == targetOwner || shooter.shipId == target.shipId || shooter.weapons.isEmpty()) return
-        val maxRange = shooter.weapons.maxOf { it.range } + target.hitRadius + 150f
+        val maxRange = shooter.maxRange + target.hitRadius + 150f
         if (!ever(timeline) { d2 -> d2 <= maxRange * maxRange }) return
 
-        val gunnery = Gunnery(shooter, timeline)
+        val gunnery = Gunnery(shooter, timeline, autoUseSystem = true)
         val spent = if (recordFlux) floats() else null
         val gate = ShooterFlux(shooter, quiet, pressure, spent)
         val enabled = if (discipline != null) BooleanArray(shooter.weapons.size) { true } else null
@@ -291,7 +291,12 @@ class FireControl(
  * ammo, and the flux each shot costs from a [FluxGate]. Each step every weapon engages the [FireControl] the caller
  * names for it (or none), so one shooter can spread its weapons over several targets ([Volley]).
  */
-class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
+class Gunnery(
+    private val shooter: SimShooter,
+    private val timeline: Timeline,
+    /** Use the shooter's system whenever it is ready and a weapon it boosts could fire ([SystemClock]): enemies. */
+    autoUseSystem: Boolean = false,
+) {
     internal class WeaponState(w: SimWeapon) {
         var phase = w.phase
         var timeLeft = w.phaseTimeLeft
@@ -305,11 +310,17 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
     private val weapons = shooter.weapons
     private val states = Array(weapons.size) { WeaponState(weapons[it]) }
     private val dtShip = DT * shooter.timeMult
-    private val maxRange = if (weapons.isEmpty()) 0f else weapons.maxOf { it.range }
+    private val maxRange = shooter.maxRange
     private val touched = ArrayList<FireControl>(4)
+    private val clock = shooter.system?.takeIf { weapons.any { w -> w.boost != null } }?.let { SystemClock(it, autoUseSystem) }
+    /** Whether the system was on in the last step. */
+    private var systemOn = false
 
     /** The turret's current aim of weapon [k], ship-local. */
     fun angle(k: Int): Float = states[k].angle
+
+    /** Weapon [k]'s range in the last step (the system's boost when it was on). */
+    fun range(k: Int): Float = weapons[k].let { w -> if (systemOn && w.boost != null) w.range * w.boost.range else w.range }
 
     /**
      * Runs every weapon through step [i]; [sinkOf] gives the target weapon k engages this step (null: none).
@@ -319,6 +330,7 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
         val time = (i + 1) * DT
         val silenced = gate.silenced()
         val sx = timeline.x[i]; val sy = timeline.y[i]; val sf = timeline.facing[i]
+        var on = clock != null && clock.isOn(i * DT)
         var trig = false
         var cosF = 1f; var sinF = 0f
         var lastSink: FireControl? = null
@@ -358,7 +370,8 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
                 my = sy + w.mountX * sinF + w.mountY * cosF
                 val dx = px - mx; val dy = py - my
                 dist = sqrt(dx * dx + dy * dy)
-                inRange = dist <= w.range + hitRadius
+                val boost = w.boost
+                inRange = dist <= w.range * (if (on && boost != null) boost.range else 1f) + hitRadius
                 val localBearing = shortestRotation(sf, angleOf(dx, dy))
                 val angularRadius = if (dist > hitRadius) asin(hitRadius / dist) * RAD_TO_DEG else 90f
                 val offSlot = shortestRotation(w.slotAngle, localBearing)
@@ -370,11 +383,22 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
                 val maxTurn = w.turnRate * dtShip
                 st.angle = normalizeAngle(st.angle + turn.coerceIn(-maxTurn, maxTurn))
                 aimed = w.noAim || abs(shortestRotation(st.angle, localBearing)) <= angularRadius + 1f
+
+                // the system goes on once a weapon it strengthens could fire with it (worst case, autoUse only)
+                if (!on && clock != null && boost != null && boost.strengthens && inArc && aimed && !silenced &&
+                    (enabled == null || enabled[k]) && dist <= w.range * boost.range + hitRadius && clock.tryUse(i * DT)) {
+                    on = true
+                    inRange = true
+                }
             }
             val canEngage = inRange && inArc && !silenced && (enabled == null || enabled[k])
+            val b = if (on) w.boost else null
+            val rof = b?.rof ?: 1f
+            val dmg = vsSize * (b?.damage ?: 1f)
+            val fluxCost = w.fluxCost * (b?.flux ?: 1f)
 
             if (canEngage && aimed) {
-                sink!!.pendingDps += w.sustainedDps
+                sink!!.pendingDps += w.sustainedDps * rof * (b?.damage ?: 1f)
                 sink.pendingBearing = angleOf(sx - px, sy - py)
             }
 
@@ -386,11 +410,13 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
                 when (st.phase) {
                     WeaponPhase.READY -> {
                         if (!canEngage || !aimed || st.ammo == 0) break@cycle
-                        val cost = if (w.mode == FireMode.BEAM) w.fluxCost * budget else w.fluxCost
+                        val cost = if (w.mode == FireMode.BEAM) fluxCost * budget else fluxCost
                         if (!gate.affords(cost)) break@cycle
                         if (w.mode != FireMode.BEAM) gate.spend(cost)
                         if (w.chargeUp > 0f) {
-                            st.phase = WeaponPhase.CHARGING; st.timeLeft = w.chargeUp
+                            st.phase = WeaponPhase.CHARGING
+                            val beam = w.mode == FireMode.BEAM || w.mode == FireMode.BURST_BEAM
+                            st.timeLeft = if (beam) w.chargeUp else refireDelay(w.chargeUp, rof)
                         } else startFiring(w, st)
                     }
                     WeaponPhase.CHARGING -> {
@@ -403,19 +429,19 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
                         if (silenced) { endBurst(w, st); break@cycle }
                         when (w.mode) {
                             FireMode.BEAM -> {
-                                val cost = w.fluxCost * budget
+                                val cost = fluxCost * budget
                                 if (!canEngage || !gate.affords(cost)) {
                                     st.phase = WeaponPhase.READY; break@cycle
                                 }
                                 gate.spend(cost)
-                                sink!!.beamTick(w, st, shooter, time, mx, my, dist, aimed, vsSize)
+                                sink!!.beamTick(w, st, shooter, time, mx, my, dist, aimed, dmg)
                                 break@cycle
                             }
                             FireMode.BURST_BEAM -> {
-                                if (sink != null) sink.beamTick(w, st, shooter, time, mx, my, dist, aimed && inRange, vsSize)
+                                if (sink != null) sink.beamTick(w, st, shooter, time, mx, my, dist, aimed && inRange, dmg)
                                 if (st.timeLeft > budget + EPS) { st.timeLeft -= budget; break@cycle }
                                 budget = max(0f, budget - st.timeLeft)
-                                endBurst(w, st)
+                                endBurst(w, st, rof)
                             }
                             else -> {
                                 while (st.shotsLeft > 0 && st.timeLeft <= budget + EPS) {
@@ -424,14 +450,14 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
                                         // the shot leaves part way through the step
                                         val shotTime = time - budget / shooter.timeMult
                                         sink?.shoot(w, shooter, timeline, i, shotTime, mx, my, sf + st.angle, dist,
-                                            aimed && inRange, vsSize)
+                                            aimed && inRange, dmg)
                                         if (st.ammo > 0) st.ammo--
                                     }
                                     st.shotsLeft--
-                                    st.timeLeft = w.burstDelay.coerceAtLeast(1e-3f)
+                                    st.timeLeft = refireDelay(w.burstDelay, rof).coerceAtLeast(1e-3f)
                                 }
                                 if (st.shotsLeft > 0) { st.timeLeft -= budget; break@cycle }
-                                endBurst(w, st)
+                                endBurst(w, st, rof)
                             }
                         }
                     }
@@ -445,6 +471,7 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
         }
         for (k in touched.indices) touched[k].flushDps(i)
         touched.clear()
+        systemOn = on
     }
 
     private fun startFiring(w: SimWeapon, st: WeaponState) {
@@ -454,9 +481,9 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
         st.beamTick = 0f
     }
 
-    private fun endBurst(w: SimWeapon, st: WeaponState) {
+    private fun endBurst(w: SimWeapon, st: WeaponState, rof: Float = 1f) {
         st.phase = WeaponPhase.COOLDOWN
-        st.timeLeft = w.cooldown
+        st.timeLeft = refireDelay(w.cooldown, rof)
         st.shotsLeft = 0
     }
 

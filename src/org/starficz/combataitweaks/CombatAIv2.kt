@@ -7,7 +7,7 @@ import com.fs.starfarer.api.util.IntervalUtil
 import org.json.JSONObject
 import org.lazywizard.lazylib.MathUtils
 import org.starficz.combataitweaks.decide.MoveController
-import org.starficz.combataitweaks.decide.SystemProfiles
+import org.starficz.combataitweaks.decide.MobilityPhases
 import org.starficz.combataitweaks.decide.ShieldController
 import org.starficz.combataitweaks.decide.VentController
 import org.starficz.combataitweaks.predictor.PredictorManager
@@ -124,7 +124,7 @@ class CombatAIv2(val ship: ShipAPI, val config: CombatAIConfig = CombatAIConfig(
 
         if (fallback) {
             // nothing to fight: burn the mobility system to travel toward a far target, else leave it to vanilla
-            if (SystemProfiles.of(ship)?.enforceOverride == true) MoveController.useSystem(ship, travel)
+            if (MobilityPhases.of(ship)?.enforceOverride == true) MoveController.useSystem(ship, travel)
             return
         }
         moveController.apply(ventController.holdWhileVenting)

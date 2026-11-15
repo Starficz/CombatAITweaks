@@ -40,7 +40,7 @@ import kotlin.math.sqrt
 class MoveController(private val ship: ShipAPI, private val config: CombatAIConfig) {
 
     private val decider = MoveDecider()
-    private val profile = SystemProfiles.of(ship)
+    private val profile = MobilityPhases.of(ship)
 
     /** The latest decision; null while there is no fresh prediction (vanilla moves on its own). */
     var choice: MoveChoice? = null
@@ -68,8 +68,8 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
      *   safety).
      */
     fun options(target: ShipAPI?, latest: Map<String, RequestResult>): List<OptionRequest> {
-        val plain = profile?.let { SystemProfiles.plainPhases(ship, it) } ?: emptyList()
-        val sys = profile?.let { SystemProfiles.systemPhases(ship, it) }
+        val plain = if (profile != null) MobilityPhases.plainPhases(ship) else emptyList()
+        val sys = profile?.let { MobilityPhases.systemPhases(ship, it) }
         val list = ArrayList<OptionRequest>(11)
         list += OptionRequest(HOLD, OwnPlan.Hold(plain), withVent = true)
         if (target != null) {

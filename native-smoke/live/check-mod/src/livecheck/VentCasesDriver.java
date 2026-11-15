@@ -30,6 +30,10 @@ import java.util.List;
 //  control:   the Hyperion removed, same flux     -> CAT vents (the restraint was the threat, not a broken vent)
 //  drone:     a Tempest 1300 away, guns blocked, its drone strike system free -> the prediction has the system's
 //             1200-damage hit from the Tempest itself, and CAT doesn't vent
+//  feeder:    a Hammerhead (Accelerated Ammo Feeder) parked 1500 away, guns and system blocked -> its captured
+//             ballistic weapons carry the system's boost (fire rate x2, flux x0.5) and its system is ready now; fired
+//             from 600 at the CAT ship for 7 s its ballistics deal clearly more with the system than without; then
+//             with the system on, the captured weapons (system-off values) match the idle capture
 //  pursuit:   the aibattle Hound case (plan §14): a CAT Hound (no shield, default limits) at 90% hard flux, a Shrike
 //             (Plasma Burn on 1 of 2 charges, Heavy Blaster) 640 away, both free -> any vent CAT calls safe stays
 //             within its limits, and a burn on the last charge is captured running (not "out of ammo, never")
@@ -37,13 +41,15 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
     private static final Logger log = Global.getLogger(VentCasesDriver.class);
     private static final float HOUND_PARK_X = -9000f, HOUND_PARK_Y = 9000f, HOUND_X = -6000f, HOUND_Y = 3000f;
 
-    private enum Phase { WARMUP, CALM, CLEAR_1, TORPEDO_ARM, TORPEDO, CLEAR_2, BURN_ARM, BURN, CONTROL, CLEAR_3, DRONE_ARM, DRONE, PURSUIT_ARM, PURSUIT, DONE }
+    private enum Phase { WARMUP, CALM, CLEAR_1, TORPEDO_ARM, TORPEDO, CLEAR_2, BURN_ARM, BURN, CONTROL, CLEAR_3, DRONE_ARM, DRONE, FEEDER_ARM, FEEDER_ON, PURSUIT_ARM, PURSUIT, DONE }
 
     private CombatEngineAPI engine;
     private boolean active;
     private int frame = 0, phaseStart = 0;
     private Phase phase = Phase.WARMUP;
-    private ShipAPI p, flag, parkedEnemy, jumper, tempest, hound, shrike;
+    private ShipAPI p, flag, parkedEnemy, jumper, tempest, hound, shrike, feeder;
+    private org.starficz.combataitweaks.sim.SimShooter feederIdle;
+    private int controlArmedAt = -1;
     private final VentAudit audit = new VentAudit();
     private boolean shrikeBurnedDuringVent = false;
     private float closestDuringVent = Float.MAX_VALUE;
@@ -159,6 +165,11 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
             } else pin(hound, HOUND_PARK_X, HOUND_PARK_Y);
             if (hound != null) hound.blockCommandForOneFrame(ShipCommand.VENT_FLUX);
         }
+        if (feeder != null && feeder.isAlive()) {
+            pin(feeder, 0f, 1500f);
+            feeder.blockCommandForOneFrame(ShipCommand.FIRE);
+            if (phase == Phase.FEEDER_ARM) feeder.blockCommandForOneFrame(ShipCommand.USE_SYSTEM);
+        }
         if (tempest != null && tempest.isAlive()) {
             pin(tempest, 0f, 1300f);
             tempest.blockCommandForOneFrame(ShipCommand.FIRE);
@@ -236,16 +247,21 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
                             + (ventedDuring ? " (vented: " + ventedTrace + ")" : " (no vent)"));
                     if (jumper != null) engine.removeEntity(jumper);
                     jumper = null;
-                    if (!venting) setFlux(0.5f);
+                    controlArmedAt = -1;
                     enter(Phase.CONTROL);
                 }
                 break;
             case CONTROL:
+                // a vent the jump case ended on finishes first; then the same flux as there
+                if (controlArmedAt < 0) {
+                    if (!venting) { setFlux(0.5f); controlArmedAt = age(); }
+                    break;
+                }
                 if (catVenting()) {
                     note("control: " + trace());
                     expect(true, "control: with the Hyperion gone CAT vents at the same flux");
                     enter(Phase.CLEAR_3);
-                } else if (age() > 300) {
+                } else if (age() - controlArmedAt > 300) {
                     expect(false, "control: with the Hyperion gone CAT vents at the same flux (last decision: " + trace() + ")");
                     setFlux(0f);
                     enter(Phase.CLEAR_3);
@@ -272,6 +288,34 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
                             "drone: no vent into the drone strike" + (ventedDuring ? " (vented: " + ventedTrace + ")" : ""));
                     if (tempest != null) engine.removeEntity(tempest);
                     tempest = null;
+                    setFlux(0f);
+                    feeder = engine.getFleetManager(1).spawnShipOrWing("hammerhead_Elite", new Vector2f(0f, 1500f), 270f);
+                    expect(feeder != null && feeder.getSystem() != null
+                            && "ammofeed".equals(feeder.getSystem().getSpecAPI().getId()), "feeder: Hammerhead (ammofeed) spawned");
+                    enter(Phase.FEEDER_ARM);
+                }
+                break;
+            }
+            case FEEDER_ARM:
+                if (age() >= 60 && feeder != null) {
+                    feederIdle = feederShooter();
+                    checkFeederIdle(feederIdle);
+                    enter(Phase.FEEDER_ON);
+                }
+                break;
+            case FEEDER_ON: {
+                com.fs.starfarer.api.combat.ShipSystemAPI sys = feeder == null ? null : feeder.getSystem();
+                // the system was blocked through the arm phase (this frame's block is lifted)
+                if (age() == 1 && feeder != null) feeder.useSystem();
+                if (sys != null && sys.getState() == com.fs.starfarer.api.combat.ShipSystemAPI.SystemState.ACTIVE) {
+                    checkFeederOn(feederIdle, feederShooter());
+                    engine.removeEntity(feeder);
+                    feeder = null;
+                    enter(Phase.PURSUIT_ARM);
+                } else if (age() > 300) {
+                    expect(false, "feeder: the system came on when used (state " + (sys == null ? "-" : sys.getState()) + ")");
+                    if (feeder != null) engine.removeEntity(feeder);
+                    feeder = null;
                     enter(Phase.PURSUIT_ARM);
                 }
                 break;
@@ -350,6 +394,117 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
             default:
                 break;
         }
+    }
+
+    private org.starficz.combataitweaks.sim.SimShooter feederShooter() {
+        org.starficz.combataitweaks.sim.DamageInputs in = org.starficz.combataitweaks.capture.DamageCaptureKt
+                .captureDamage(engine, java.util.Collections.singleton(p.getId()));
+        return in.getShooterById().get(feeder.getId());
+    }
+
+    private static String weapons(org.starficz.combataitweaks.sim.SimShooter s) {
+        StringBuilder b = new StringBuilder();
+        for (org.starficz.combataitweaks.sim.SimWeapon w : s.getWeapons()) {
+            org.starficz.combataitweaks.sim.WeaponBoost bo = w.getBoost();
+            b.append(String.format("[%s dmg %.0f cd %.3f burst %d/%.3f flux %.1f range %.0f boost %s] ", w.getWeaponClass(),
+                    w.getDamage(), w.getCooldown(), w.getBurstSize(), w.getBurstDelay(), w.getFluxCost(), w.getRange(),
+                    bo == null ? "-" : String.format("rof %.2f dmg %.2f flux %.2f range %.2f", bo.getRof(), bo.getDamage(),
+                            bo.getFlux(), bo.getRange())));
+        }
+        return b.toString();
+    }
+
+    // the idle Hammerhead as captured: boosted ballistics, the system ready, and the sim's fire with it stronger
+    private void checkFeederIdle(org.starficz.combataitweaks.sim.SimShooter s) {
+        expect(s != null, "feeder: the Hammerhead is captured as a shooter");
+        if (s == null) return;
+        note("feeder idle: " + weapons(s));
+        boolean ballisticsBoosted = true, othersPlain = true;
+        java.util.List<org.starficz.combataitweaks.sim.SimWeapon> ballistic = new java.util.ArrayList<>();
+        for (org.starficz.combataitweaks.sim.SimWeapon w : s.getWeapons()) {
+            org.starficz.combataitweaks.sim.WeaponBoost b = w.getBoost();
+            if (w.getWeaponClass() == org.starficz.combataitweaks.sim.WeaponClass.BALLISTIC) {
+                ballistic.add(w);
+                ballisticsBoosted &= b != null && Math.abs(b.getRof() - 2f) < 0.01f && Math.abs(b.getFlux() - 0.5f) < 0.01f;
+            } else if (b != null) othersPlain = false;
+        }
+        expect(!ballistic.isEmpty() && ballisticsBoosted, "feeder: its ballistic weapons carry fire rate x2, flux x0.5");
+        expect(othersPlain, "feeder: its other weapons carry no boost");
+        org.starficz.combataitweaks.sim.ShooterSystem sys = s.getSystem();
+        expect(sys != null && sys.getReadyIn() < 0.01f && sys.getOnLeft() == 0f,
+                "feeder: its system is captured ready now and off"
+                        + (sys == null ? " (none)" : String.format(" (readyIn %.2f, onLeft %.2f, onTime %.2f, cooldown %.2f)",
+                        sys.getReadyIn(), sys.getOnLeft(), sys.getOnTime(), sys.getCooldown())));
+        // the sim's fire of its ballistics from 600 at the captured CAT ship over 7 s, with and without the system
+        org.starficz.combataitweaks.sim.DamageInputs in = org.starficz.combataitweaks.capture.DamageCaptureKt
+                .captureDamage(engine, java.util.Collections.singleton(p.getId()));
+        org.starficz.combataitweaks.sim.SimDefense def = in.getDefenses().get(p.getId());
+        float with = fired(s, ballistic, sys, def), without = fired(s, ballistic, null, def);
+        // the known answer from the captured weapons: bursts back to back, the cooldown at the fire rate, the delay
+        // between burst shots no shorter than vanilla's minRefireDelay
+        float expectWith = 0f, expectWithout = 0f;
+        for (org.starficz.combataitweaks.sim.SimWeapon w : ballistic) {
+            expectWith += w.getDamage() * shotsIn(w, w.getBoost().getRof(), 7f);
+            expectWithout += w.getDamage() * shotsIn(w, 1f, 7f);
+        }
+        note(String.format("feeder: ballistic damage over 7 s from 600: %.0f with the system (expected %.0f), %.0f without (%.0f)",
+                with, expectWith, without, expectWithout));
+        expect(without > 0f && Math.abs(with - expectWith) <= 0.05f * expectWith && Math.abs(without - expectWithout) <= 0.05f * expectWithout
+                        && with > without,
+                "feeder: the sim's ballistic fire matches the fire cycle at the system's fire rate, and without it");
+    }
+
+    // shots a weapon fires in [horizon] s from ready: bursts back to back, each burst's shots refireDelay apart
+    private static int shotsIn(org.starficz.combataitweaks.sim.SimWeapon w, float rof, float horizon) {
+        float delay = org.starficz.combataitweaks.sim.SystemsKt.refireDelay(w.getBurstDelay(), rof);
+        float cooldown = org.starficz.combataitweaks.sim.SystemsKt.refireDelay(w.getCooldown(), rof);
+        int shots = 0;
+        float t = 0f;
+        while (t < horizon) {
+            for (int k = 0; k < w.getBurstSize() && t < horizon; k++) {
+                shots++;
+                if (k < w.getBurstSize() - 1) t += delay;
+            }
+            t += cooldown;
+        }
+        return shots;
+    }
+
+    private float fired(org.starficz.combataitweaks.sim.SimShooter s, java.util.List<org.starficz.combataitweaks.sim.SimWeapon> weapons,
+                        org.starficz.combataitweaks.sim.ShooterSystem sys, org.starficz.combataitweaks.sim.SimDefense def) {
+        int steps = 140;
+        org.starficz.combataitweaks.sim.Timeline target = new org.starficz.combataitweaks.sim.Timeline(steps);
+        org.starficz.combataitweaks.sim.Timeline shooter = new org.starficz.combataitweaks.sim.Timeline(steps);
+        for (int i = 0; i < steps; i++) { shooter.getY()[i] = 600f; shooter.getFacing()[i] = 270f; target.getFacing()[i] = 90f; }
+        org.starficz.combataitweaks.sim.SimShooter copy = new org.starficz.combataitweaks.sim.SimShooter(s.getShipId(), s.getOwner(),
+                0f, 0f, s.getMaxFlux(), s.getDissipation(), s.getTimeMult(), 0f, s.getDamageVsSize(), weapons, null, sys);
+        org.starficz.combataitweaks.sim.FireControl fc = new org.starficz.combataitweaks.sim.FireControl(def, p.getOwner(), target, null);
+        fc.fire(copy, shooter, null, null, null, false);
+        float sum = 0f;
+        for (org.starficz.combataitweaks.sim.Hit h : fc.getHits()) sum += h.getDamage();
+        return sum;
+    }
+
+    // with the system on, the captured weapons are still the system-off values (its part taken out of the live ones)
+    private void checkFeederOn(org.starficz.combataitweaks.sim.SimShooter idle, org.starficz.combataitweaks.sim.SimShooter on) {
+        expect(idle != null && on != null && idle.getWeapons().size() == on.getWeapons().size(), "feeder: captured on and off");
+        if (idle == null || on == null || idle.getWeapons().size() != on.getWeapons().size()) return;
+        note("feeder on: " + weapons(on));
+        boolean same = true;
+        for (int k = 0; k < idle.getWeapons().size(); k++) {
+            org.starficz.combataitweaks.sim.SimWeapon a = idle.getWeapons().get(k), b = on.getWeapons().get(k);
+            same &= close(a.getCooldown(), b.getCooldown()) && close(a.getBurstDelay(), b.getBurstDelay())
+                    && close(a.getFluxCost(), b.getFluxCost()) && close(a.getDamage(), b.getDamage()) && close(a.getRange(), b.getRange());
+        }
+        expect(same, "feeder: with the system on, the captured weapons match the system-off capture");
+        org.starficz.combataitweaks.sim.ShooterSystem sys = on.getSystem();
+        expect(sys != null && sys.getOnLeft() > 0.5f && sys.getReadyIn() > sys.getOnLeft(),
+                "feeder: the system is captured on, ready again only after its cooldown"
+                        + (sys == null ? " (none)" : String.format(" (onLeft %.2f, readyIn %.2f)", sys.getOnLeft(), sys.getReadyIn())));
+    }
+
+    private static boolean close(float a, float b) {
+        return Math.abs(a - b) <= 0.01f * Math.max(1f, Math.abs(a));
     }
 
     // the Shrike's system live, and as the motion capture gives it to the sim

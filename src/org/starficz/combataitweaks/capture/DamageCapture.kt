@@ -43,7 +43,9 @@ import org.starficz.combataitweaks.sim.SimWeapon
 import org.starficz.combataitweaks.sim.SystemThreat
 import org.starficz.combataitweaks.getOnTimeRemaining
 import org.starficz.combataitweaks.sim.SubmunitionInfo
+import org.starficz.combataitweaks.sim.WeaponClass
 import org.starficz.combataitweaks.sim.WeaponPhase
+import org.starficz.combataitweaks.sim.refireDelay
 import java.util.WeakHashMap
 import kotlin.math.cos
 import kotlin.math.max
@@ -167,7 +169,11 @@ private fun ShipAPI.toLocal(p: Vector2f): Pair<Float, Float> {
 
 private fun ShipAPI.toShooter(): SimShooter? {
     if (isHoldFire) return null
-    val weapons = allWeapons.mapNotNull { captureWeapon(it) }
+    // the system's effect on the weapons (plan §11b): weapons are captured with it off, plus its boost
+    SystemProfiles.learn(this)
+    val profile = SystemProfiles.of(this)
+    val weapons = allWeapons.mapNotNull { captureWeapon(it, weaponFactors(it, profile)) }
+    val system = if (weapons.any { it.boost != null }) captureShooterSystem() else null
     val systemThreat = captureSystemThreat()
     if (weapons.isEmpty() && systemThreat == null) return null
     val tm = mutableStats.timeMult.modifiedValue.coerceAtLeast(0.01f)
@@ -185,7 +191,7 @@ private fun ShipAPI.toShooter(): SimShooter? {
     return SimShooter(
         shipId = id, owner = owner, flux = fluxTracker.currFlux, hardFlux = fluxTracker.hardFlux,
         maxFlux = fluxTracker.maxFlux, dissipation = stats.fluxDissipation.modifiedValue, timeMult = tm,
-        silenceTime = silence, damageVsSize = vsSize, weapons = weapons, systemThreat = systemThreat,
+        silenceTime = silence, damageVsSize = vsSize, weapons = weapons, systemThreat = systemThreat, system = system,
     )
 }
 
@@ -238,7 +244,10 @@ private fun ShipAPI.damageFactor(w: WeaponAPI): Float {
     return ((1f + percent / 100f + flat) * mult).coerceAtLeast(0f)
 }
 
-private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
+/**
+ * One weapon, with its ship's system off: [sys] takes the system's part out of the live values and gives its boost.
+ */
+private fun ShipAPI.captureWeapon(w: WeaponAPI, sys: WeaponSystemFactors): SimWeapon? {
     if (w.isDecorative || w.slot.isDecorative || w.slot.isHidden || w.isPermanentlyDisabled) return null
     if (w.type == WeaponAPI.WeaponType.LAUNCH_BAY) return null
     if (w.hasAIHint(WeaponAPI.AIHints.PD_ONLY)) return null
@@ -246,7 +255,7 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
     val spec = w.spec
     val dmg = w.damage ?: return null
     val tm = mutableStats.timeMult.modifiedValue.coerceAtLeast(0.01f)
-    val factor = damageFactor(w)
+    val factor = damageFactor(w) / sys.damage.now
     val baseDamage = dmg.baseDamage
     if (baseDamage <= 0f && dmg.fluxComponent <= 0f) return null
 
@@ -262,9 +271,20 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
     val projSpec = spec as? ProjectileWeaponSpecAPI
     val beamSpec = spec as? BeamWeaponSpecAPI
     val specRefire = projSpec?.refireDelay ?: 0f
-    val rof = if (specRefire > 0f && w.refireDelay > 0f) w.refireDelay / specRefire else 1f
+    val refireRatio = if (specRefire > 0f && w.refireDelay > 0f) w.refireDelay / specRefire else 1f
+    // fire rate (translation of obfuscated code: the projectile and burst beam weapon trackers, combat.entities.ship.A.J
+    // and A.G): the ship's fire-rate stat for the weapon's type isn't in getRefireDelay(); it runs the weapon's clock
+    // faster (projectile weapons: charge, burst delay and cooldown; burst beams: the cooldown), never below
+    // minRefireDelay ([refireDelay]). Without the system's part.
+    val liveRof = when (sys.weaponClass) {
+        WeaponClass.BALLISTIC -> mutableStats.ballisticRoFMult.modifiedValue
+        WeaponClass.ENERGY -> mutableStats.energyRoFMult.modifiedValue
+        WeaponClass.MISSILE -> mutableStats.missileRoFMult.modifiedValue
+        WeaponClass.OTHER -> 1f
+    }.coerceAtLeast(0.01f)
+    val rof = liveRof / sys.rof.now
     val burst = if (w.isBeam) 1 else spec.burstSize.coerceAtLeast(1)
-    val burstDelay = (projSpec?.burstDelay ?: 0f) * rof
+    val burstDelay = refireDelay((projSpec?.burstDelay ?: 0f) * refireRatio, rof)
     // Burst beams ramp (translation of obfuscated code: the beam weapon tracker and BeamWeaponRay): brightness goes
     // 0 -> 1 linearly over the charge-up, holds for the burst, then 1 -> 0 over the charge-down, and damage scales
     // with brightness squared, so each ramp is worth a third of its length at full power. The sim fires at full power
@@ -275,12 +295,12 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
     val chargeUp = when {
         w.isBurstBeam -> rampUp * 2f / 3f
         w.isBeam -> beamSpec?.chargeupTime ?: 0f
-        else -> spec.chargeTime
+        else -> refireDelay(spec.chargeTime, rof)
     }
     val cooldown = when (mode) {
         FireMode.BEAM -> 0f
-        FireMode.BURST_BEAM -> (w.cooldown - rampDown / 3f).coerceAtLeast(0f)
-        else -> w.refireDelay
+        FireMode.BURST_BEAM -> refireDelay((w.cooldown - rampDown / 3f).coerceAtLeast(0f), rof)
+        else -> refireDelay(w.refireDelay, rof)
     }
     val burstDuration = if (w.isBurstBeam) (beamSpec?.burstDuration ?: 1f) + (rampUp + rampDown) / 3f else 0f
 
@@ -302,7 +322,7 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
                 fading > 0.01f && rampDown > 0f -> {
                     phase = WeaponPhase.FIRING; timeLeft = fading * fading * fading * rampDown / 3f
                 }
-                w.cooldownRemaining > 0f -> { phase = WeaponPhase.COOLDOWN; timeLeft = w.cooldownRemaining }
+                w.cooldownRemaining > 0f -> { phase = WeaponPhase.COOLDOWN; timeLeft = w.cooldownRemaining / liveRof }
             }
         }
         w.isInBurst -> {
@@ -310,7 +330,7 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
             shotsLeft = if (burstDelay > 0f) (w.burstFireTimeRemaining / burstDelay).toInt() + 1 else 1
             shotsLeft = shotsLeft.coerceIn(1, burst)
         }
-        w.cooldownRemaining > 0f -> { phase = WeaponPhase.COOLDOWN; timeLeft = w.cooldownRemaining }
+        w.cooldownRemaining > 0f -> { phase = WeaponPhase.COOLDOWN; timeLeft = w.cooldownRemaining / liveRof }
         w.isFiring && w.chargeLevel > 0f && chargeUp > 0f -> {
             phase = WeaponPhase.CHARGING; timeLeft = chargeUp * (1f - w.chargeLevel)
         }
@@ -336,11 +356,11 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
         mountX = mx, mountY = my,
         slotAngle = w.arcFacing, arc = w.arc, turnRate = w.turnRate,
         angle = org.starficz.combataitweaks.sim.shortestRotation(facing, w.currAngle),
-        range = w.range, mode = mode, damage = damage, emp = dmg.fluxComponent,
+        range = w.range / sys.range.now, mode = mode, damage = damage, emp = dmg.fluxComponent,
         kind = w.damageType.toKind(),
         softFlux = if (w.isBeam) !dmg.isForceHardFlux else dmg.isSoftFlux,
         chargeUp = chargeUp, burstSize = burst, burstDelay = burstDelay, burstDuration = burstDuration,
-        cooldown = cooldown, fluxCost = w.fluxCostToFire,
+        cooldown = cooldown, fluxCost = w.fluxCostToFire / sys.flux.now,
         phase = phase, phaseTimeLeft = timeLeft, shotsLeftInBurst = shotsLeft,
         disabledFor = if (w.isDisabled) w.disabledDuration / tm else 0f,
         ammo = if (w.usesAmmo()) w.ammo else -1, maxAmmo = w.maxAmmo, ammoPerSecond = w.ammoPerSecond,
@@ -349,6 +369,7 @@ private fun ShipAPI.captureWeapon(w: WeaponAPI): SimWeapon? {
         conservative = w.usesAmmo() && w.ammoPerSecond < 0.2f && !w.hasAIHint(WeaponAPI.AIHints.DO_NOT_CONSERVE),
         noAim = guided, missile = missile, sustainedDps = sustained,
         strike = w.hasAIHint(WeaponAPI.AIHints.STRIKE), vsFrigates = w.hasAIHint(WeaponAPI.AIHints.USE_VS_FRIGATES),
+        weaponClass = sys.weaponClass, boost = sys.boost(),
     )
 }
 

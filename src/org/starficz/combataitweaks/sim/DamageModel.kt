@@ -273,6 +273,12 @@ class SimWeapon(
     /** Autofire (plan §13.1): `STRIKE` weapons skip frigates unless also `USE_VS_FRIGATES`. */
     val strike: Boolean = false,
     val vsFrigates: Boolean = false,
+    val weaponClass: WeaponClass = WeaponClass.OTHER,
+    /**
+     * What the shooter's system does to it while on ([SimShooter.system]); null when nothing. The values above are
+     * with the system off.
+     */
+    val boost: WeaponBoost? = null,
 )
 
 /** A ship or fighter that can shoot, with its flux budget (plan §5.6). */
@@ -291,7 +297,12 @@ class SimShooter(
     val weapons: List<SimWeapon>,
     /** Its ship system, when the system's AI hints say it deals damage. */
     val systemThreat: SystemThreat? = null,
-)
+    /** Its ship system's timing, when the system boosts some of its weapons ([SimWeapon.boost]). */
+    val system: ShooterSystem? = null,
+) {
+    /** The farthest any weapon reaches, the system's range boost included: for the range culls. */
+    val maxRange: Float = weapons.maxOfOrNull { it.range * (it.boost?.range ?: 1f) } ?: 0f
+}
 
 /**
  * A ship system that deals damage (the Tempest's drone strike, the Omen's EMP emitter...), from its AI hints: the

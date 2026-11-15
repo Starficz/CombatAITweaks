@@ -1,0 +1,13 @@
+id,use,ballistic_rof,energy_rof,missile_rof,ballistic_damage,energy_damage,missile_damage,beam_damage,ballistic_flux,energy_flux,missile_flux,beam_flux,ballistic_range,energy_range,missile_range,beam_range,max_speed,acceleration,deceleration,enforce_override,notes
+# What each ship system does for Combat AI Tweaks' simulation. Other mods can ship this same path with rows for their own systems (a row with an existing id replaces it).,,,,,,,,,,,,,,,,,,,,,
+# use: offensive (boosts its ship's weapons: enemies use it whenever ready and a boosted weapon could fire) / mobility (the protected ship's movement options) / defensive (not modelled yet).,,,,,,,,,,,,,,,,,,,,,
+# Values are the system's stats script modifiers at full effect: x2 = modifyMult 2 / +50% = modifyPercent 50 / +40 = modifyFlat 40. Several in one cell are separated by spaces. Blank = unchanged.,,,,,,,,,,,,,,,,,,,,,
+# Rof is the fire rate (ballistic_rof x2 halves the cooldown). Flux is the flux cost of firing. Offensive systems without a row are learned the first time one is seen fully on.,,,,,,,,,,,,,,,,,,,,,
+# enforce_override (mobility): block vanilla's own use of the system whenever CAT isn't using it.,,,,,,,,,,,,,,,,,,,,,
+ammofeed,offensive,x2,,,,,,,x0.5,,,,,,,,,,,,AmmoFeedStats
+highenergyfocus,offensive,,,,,+50%,,,,,,,,,,,,,,,HighEnergyFocusStats
+lidararray,offensive,x3,x3,,,,,,,,,,+100%,+100%,,,,,,,LidarArrayStats; its passive range bonus while off is left out while it is on
+maneuveringjets,mobility,,,,,,,,,,,,,,,,+50,+200%,+200%,TRUE,ManeuveringJetsStats; turn rate left out
+plasmajets,mobility,,,,,,,,,,,,,,,,+125,+375%,+375%,TRUE,PlasmaJetsStats; turn rate left out
+SCY_secondaryThrusters,mobility,,,,,,,,,,,,,,,,+100,+200%,+200%,TRUE,SCY_secondaryThrustersStats
+SCY_armorSwitch,mobility,,,,,,,,,,,,,,,,+40,+150%,+150%,,ArmorSwitchStats (a toggle)

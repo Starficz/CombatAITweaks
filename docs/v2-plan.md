@@ -591,11 +591,68 @@ The worst case ignores several things, and each makes CAT more cautious than rea
 When the tuning milestone finds ships too cautious (missile-heavy enemies are the likely case), the first lever
 is an expected PD interception factor on missiles, before touching `H`.
 
-## 11b. Later: defensive systems
+## 11b. Ship systems (offensive and defensive)
 
-Milestone 6, after movement works: `…+DEFENSE` options for P's defensive systems, which change whether venting
-or holding is affordable. That means the damper field and fortress shield, and SCY's twin and stasis shields.
-Their effects come from explicit profiles from the stats scripts; the AI hints don't describe damage reduction.
+Agreed 2026-11-15. Before this, the damage sim froze every ship's weapons as captured: an enemy system active at the
+snapshot stayed on for the whole horizon (over-prediction), and one idle but ready never fired (under-prediction:
+a Lasher or Hammerhead with its Accelerated Ammo Feeder ready doubles its ballistic fire mid-vent).
+
+**One system model for every ship.** Each ship system gets an on/off timeline per branch and a profile:
+- **Effect:** factors on its ship's stats: fire rate, damage, flux cost and range per weapon type (built); damage taken
+  per layer, shield upkeep (next, for defensive systems).
+- **Restrictions:** no firing, no shield, no venting. Read from the system spec (`isFiringAllowed`,
+  `isShieldAllowed`, `isVentingAllowed`), not the profile.
+- **Timing:** charge-up, active, charge-down, cooldown, charges and regen, from the live system.
+
+**Who uses it, when:**
+1. **Enemies (built):** worst case: on as soon as it is ready and a weapon it strengthens could fire (in range with
+   the boost, in arc, aimed), counted at full strength over the whole on-time. No branches added. For the vent-now
+   run "as soon as ready" already lands in the vent, which starts at t = 0.
+2. **P, as vanilla would (next):** one rule inside every branch, from vanilla's system AIs (the damper's is in
+   obfuscated `combat.ai.system`, reading `DamperFieldStats.getDamper`; not translated yet). P's own offensive
+   systems count only when already on at the snapshot, without charge-down: vanilla decides them, so the trade
+   doesn't count on them.
+3. **`+DEFENSE` options (after):** like `+SYSTEM`: the option with the system used now, on the options where it
+   matters (likely `HOLD`, `STANDOFF`, `BACK_OFF`: the damper blocks venting and the shield, the fortress blocks
+   firing). Each batch asks "now or not now"; batches re-ask every fraction of a second, which is the timing search.
+   "Not now" assumes no use within H (conservative). About +2–3 branches, only for ships with such a system.
+
+**Profiles, extendable** (`capture/SystemProfiles.kt`), first match wins:
+1. code: `SystemProfiles.register(...)`, for systems a table can't describe;
+2. `data/config/combataitweaks/system_profiles.csv`, merged across mods (`getMergedSpreadsheetDataForMod`): any mod
+   ships the same path with rows for its own systems;
+3. learned: an offensive system with no profile is read off its ship's stats the first time it is seen fully on
+   (effect level 1), keeping only what strengthens the ship, so a learned profile can only make CAT more careful.
+   A stopgap, and it stays one: it misses scripts that hardcode their own modifier id, effects that aren't weapon
+   stats, and every use before the first full one. Dry-running the script on detached stats, as vanilla's system AIs
+   do (`combat.ai.system.A`), was considered and set aside: too iffy. Systems that matter get a CSV row.
+
+Values are the stats script's own modifiers: `x2` (modifyMult), `+50%` (modifyPercent), `+40` (modifyFlat). Systems
+apply their stats under the id "<system id> effect" (translation of obfuscated code: `combat.systems.F`), so the
+capture takes the system's own modifiers out of the ship's stats and puts the profile's in: the factors are exact
+for that ship, whatever else it has. A system that is off may leave modifiers under its id (Lidar Array's passive
+range bonus); those stay. Adding a stat is one `ProfileStat` entry plus whatever reads it. The mobility profiles
+(maneuvering jets, plasma jets, SCY thrusters and armor switch) moved into the same CSV (`decide/MobilityPhases`).
+
+**Built 2026-11-15 (enemy offensive systems):**
+- `sim/Systems.kt`: `WeaponBoost` per weapon, `ShooterSystem` timing, `SystemClock` per branch run; `Gunnery`
+  applies the boost (`autoUseSystem` for enemies' fire at P, off for P's and its side's autofire).
+- CSV rows: `ammofeed` (ballistic fire rate x2, flux x0.5), `highenergyfocus` (energy damage +50%), `lidararray`
+  (ballistic and energy fire rate x3, range +100%; its passive bonus is left out while it is on).
+- Left out: Fast Missile Racks (no stats script: it reloads), Targeting Feed (boosts the carrier's fighters), Entropy
+  Amplifier (a debuff on the target: with the defensive work).
+- **Fire rate fix found on the way** (translation of obfuscated code: the projectile and burst beam weapon trackers,
+  `combat.entities.ship.A.J` and `A.G`): the ship's fire-rate stat isn't in `getRefireDelay()`; it runs the weapon's
+  clock faster (projectile weapons: charge, burst delay, cooldown; burst beams: the cooldown). Above x1 no delay
+  goes under `minRefireDelay` (0.05 s), and one already at or under it isn't sped up: the Heavy Needler's 0.05 s
+  burst keeps its spacing under the feeder, only its cooldown halves. The capture ignored every fire-rate bonus
+  before (hullmods and skills too); it now reads the stat.
+- Tests: unit 310 (`systemBoosts`: use at once, cooldown, waiting until ready, charges and regen, own fire only
+  counting a use already on, flux, damage, range, the refire floor). `ventcases` feeder case on a real
+  `hammerhead_Elite`: ballistics boosted (x2, x0.5), others not, system ready; the sim's ballistic fire over 7 s
+  matches the fire cycle (6000 with the system, 5100 without); with the system on, the captured weapons equal the
+  system-off capture. `movecases`, `aibattle` and `worstcase` pass.
+- Not yet seen in game: a learned profile (no offensive system without a row came up).
 
 ## 11c. Progress
 
