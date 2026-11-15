@@ -244,6 +244,9 @@ class PredictorManager private constructor() {
     /** Newest hold-position result for [shipId], or null. For the overlay, debugging tools and the battle check. */
     fun latestHoldResult(shipId: String): RequestResult? = latestResults[shipId]?.get(HOLD)
 
+    /** Newest result of option [name] for [shipId], or null (the trace). */
+    fun latestResult(shipId: String, name: String): RequestResult? = latestResults[shipId]?.get(name)
+
     /** Base-world path (current plan, then coast) of a non-CAT ship from the latest batch, or null. */
     fun latestBaseTimeline(shipId: String): Timeline? = latestEnemyTimelines[shipId]
 

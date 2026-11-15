@@ -197,12 +197,26 @@ class DemInfo(
     val targetingTime: Float,
     val firingTime: Float,
     val allowedDriftFraction: Float,
-    /** Payload: a beam (DPS for [firingTime]) or a burst of projectiles. */
+    /** Payload: a beam ([payloadDamage] per second, see [payloadDuration]) or a burst of projectiles. */
     val payloadIsBeam: Boolean,
     val payloadDamage: Float,
     val payloadEmp: Float,
     val payloadKind: DamageKind,
     val payloadSoftFlux: Boolean,
+    /**
+     * Beam payloads, at full power: seconds after firing starts until the damage begins, and how long it lasts. A burst
+     * beam ramps up and down (damage follows brightness squared, so each ramp is worth a third of its length): it
+     * starts 2/3 into its charge-up and lasts its burst + a third of both ramps.
+     */
+    val payloadStart: Float = 0f,
+    val payloadDuration: Float = firingTime,
+    /** The payload weapon's range, from the DEM to the target's edge. */
+    val payloadRange: Float = Float.MAX_VALUE,
+    /**
+     * Vanilla removes the drone, and so the payload, when the missile dies while firing (DEMScript's cleanup), unless
+     * the DEM is bomb-pumped (the missile is gone at once, the drone fires on): then false.
+     */
+    val payloadCutWithMissile: Boolean = true,
 )
 
 enum class DemState { WAIT, TURN_TO_TARGET, SIGNAL, FIRE, DONE }

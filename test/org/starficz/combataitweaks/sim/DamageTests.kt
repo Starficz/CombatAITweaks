@@ -148,6 +148,82 @@ internal fun damage() {
     standoffTrade()
     leanRuns()
     tradeScenarios()
+    ventPursuit()
+    demPayload()
+}
+
+/**
+ * A DEM's payload (plan §14, the DEM audit): a Gorgon-like DEM 900 from a still target closes to its band, paints it
+ * and fires. Its payload is a burst beam (800 DPS, 0.05 s charge-up, 0.9 s burst, 0.25 s charge-down), and damage
+ * follows brightness squared, so it deals 800 × (0.9 + 0.3 / 3) = 800, as the trace's drone beam ticks show (a
+ * ramp, then 80 per 0.1 s tick). The first model dealt the DPS for the whole 1.25 s firing time (1000).
+ */
+private fun demPayload() {
+    fun payload(range: Float = 700f, pd: PointDefense? = null, bomb: Boolean = false): List<Hit> {
+        val dem = DemInfo(
+            minDelay = 0f, triggerDistance = 525f, preferredMin = 525f, preferredMax = 525f, turnRateBoost = 100f,
+            targetingArc = 10f, targetingTime = 1f, firingTime = 1.25f, allowedDriftFraction = 0.33f,
+            payloadIsBeam = true, payloadDamage = 800f, payloadEmp = 0f, payloadKind = DamageKind.ENERGY,
+            payloadSoftFlux = true, payloadStart = 0.05f * 2f / 3f, payloadDuration = 0.9f + 0.3f / 3f,
+            payloadRange = range, payloadCutWithMissile = !bomb,
+        )
+        val info = MissileInfo(maxSpeed = 300f, acceleration = 600f, maxTurnRate = 120f, turnAcceleration = 240f,
+            launchSpeed = 75f, maxFlightTime = 6f, flameoutTime = 1f, fadeTime = 0.5f, armingTime = 0f,
+            noCollisionWhileFading = false, reduceDamageWhileFading = true, dem = dem, hitpoints = 250f)
+        val sim = MissileSim(defense(shieldOn = false), 0, still(200), pd = pd)
+        sim.run(listOf(InFlightMissile(900f, 0f, -300f, 0f, 180f, 0f, 1, 800f, 0f, DamageKind.ENERGY, true, info, 1f, "P")))
+        return sim.hits
+    }
+    val hits = payload()
+    near(hits.sumOf { it.damage.toDouble() }.toFloat(), 800f, 1f, "DEM: a burst beam payload deals its burst with the ramps' third")
+    check(hits.all { it.delivery == Delivery.BEAM && it.damage <= 80.01f }, "DEM: the payload comes in beam ticks") {
+        hits.joinToString { String.format("%.1f", it.damage) }
+    }
+    check(payload(range = 300f).isEmpty(), "DEM: a payload out of its range from the target's edge deals nothing")
+
+    // point defense on the DEM holding station 560-600 from the target's edge (a 120 DPS PD beam reaching 700):
+    // vanilla removes the drone when the missile dies while firing, so the payload is cut; a bomb-pumped DEM's missile
+    // is gone at once and its drone fires on
+    fun sum(h: List<Hit>) = h.sumOf { it.damage.toDouble() }.toFloat()
+    val pd = PointDefense(listOf(pdGun(speed = PdWeapon.BEAM_SPEED, dps = 120f, range = 700f)), 50f)
+    val cut = sum(payload(pd = pd))
+    check(cut > 0f && cut < 700f, "DEM: point defense killing it while it fires cuts the payload") { "$cut" }
+    near(sum(payload(pd = pd, bomb = true)), 800f, 1f, "DEM: a bomb-pumped payload isn't cut by killing the missile")
+}
+
+/**
+ * The Hound vent from `aibattle` (plan §14, vent pursuit), at the trace's snapshot (122.82 s, shifted to put the
+ * Hound at the origin): a Hound (no shield, 185 speed) at high flux backs off venting from a steady Shrike 637 away,
+ * closing at about 120, with Plasma Burn (burst 400, 1 s with the charge-up, 0.5 s cooldown) and a Heavy Blaster
+ * (500 energy, 600 range). Vanilla burned in and landed two hits. The capture had read the burn, started on the
+ * Shrike's last charge, as "out of ammo, never usable", and the burn itself not at all: the prediction then had the
+ * Shrike fall behind.
+ */
+private fun ventPursuit() {
+    // hull lost within the 3.9 s vent window, backing off venting
+    fun ventLoss(system: SystemInfo): Float {
+        val steps = 200
+        val p = ship("P", owner = 0, vx = -171f, vy = -81f, facing = 342f, radius = 55f, maxSpeed = 185f,
+            accel = 150f, decel = 120f, reach = 600f, engagement = 600f)
+        val e = ship("E", owner = 1, x = 578f, y = -268f, vx = -89f, vy = 80f, facing = 154f, hull = HullClass.DESTROYER,
+            radius = 70f, maxSpeed = 120f, accel = 80f, decel = 60f, reach = 600f, engagement = 600f,
+            maneuverTarget = "P", maneuverRange = 458f, system = system)
+        val branch = World(listOf(p, e), SimParams(steps)).branch("P", OwnPlan.BackAway("E"))
+        val blaster = gun(damage = 500f, range = 600f, arc = 10f, cooldown = 1.25f, fluxCost = 720f, speed = 1000f)
+        val inputs = DamageInputs(listOf(shooter(blaster, flux = 3567f, maxFlux = 8000f, dissipation = 350f)),
+            emptyList(), emptyList(),
+            mapOf("P" to defense(shield = ShieldKind.NONE, shieldOn = false, flux = 1850f, maxFlux = 2000f,
+                ventRate = 470f, hull = 2000f, armor = armorInfo(rating = 400f))))
+        val vent = DamageSim.run("P", 0, branch.timelines, inputs, withVent = true)!!.ventNow!!
+        return vent.hullLost[(3.9f / DT).toInt()]
+    }
+    val unusable = ventLoss(SystemInfo(Float.MAX_VALUE, 1f, 0.5f, 400f, 0f))
+    val ready = ventLoss(SystemInfo(0f, 1f, 0.5f, 400f, 0f))
+    // the snapshot just after the burn started: 0.9 s of it left, the next charge in 9 s
+    val burning = ventLoss(SystemInfo(9.9f, 1f, 0.5f, 400f, 0f, activeLeft = 0.9f))
+    check(unusable < 100f, "vent pursuit: without its burn the Shrike falls behind the venting Hound") { "$unusable" }
+    check(ready > 300f, "vent pursuit: with Plasma Burn ready it catches the venting Hound") { "$ready" }
+    check(burning > 300f, "vent pursuit: a burn already on at the snapshot catches it too") { "$burning" }
 }
 
 /** One side of a trade scenario: motion, guns and defences. */

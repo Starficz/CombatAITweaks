@@ -47,6 +47,7 @@ import org.starficz.combataitweaks.sim.WeaponPhase
 import java.util.WeakHashMap
 import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sin
 
 /*
@@ -430,6 +431,17 @@ private fun parseDem(b: JSONObject, script: DEMScript? = null): DemInfo? {
     val beam = payload as? BeamWeaponSpecAPI
     val trigger = b.rolled("triggerDistance", 500f)
     fun f(name: String, fallback: Float) = (script?.get(name = name) as? Float) ?: fallback
+    // the payload beam's full-power time (the burst beam ramps, as captureWeapon's): vanilla's drone fires it once,
+    // ramping up, holding for the burst, ramping down; continuous ones for the firing time after the charge-up
+    val up = beam?.chargeupTime ?: 0f
+    val down = beam?.chargedownTime ?: 0f
+    val burst = beam?.burstDuration ?: 0f
+    val start = up * 2f / 3f
+    val duration = when {
+        beam == null -> firingTime
+        burst > 0f -> min(burst + (up + down) / 3f, firingTime + down / 3f)
+        else -> max(0f, firingTime - start)
+    }
     return DemInfo(
         minDelay = f("minDelayBeforeTriggering", b.rolled("minDelayBeforeTriggering", 1f)),
         triggerDistance = f("triggerDistance", trigger),
@@ -445,6 +457,10 @@ private fun parseDem(b: JSONObject, script: DEMScript? = null): DemInfo? {
         payloadEmp = beam?.empPerSecond ?: 0f,
         payloadKind = (payload?.damageType ?: DamageType.ENERGY).toKind(),
         payloadSoftFlux = beam != null,
+        payloadStart = if (beam != null) start else 0f,
+        payloadDuration = duration,
+        payloadRange = payload?.maxRange?.takeIf { it > 0f } ?: Float.MAX_VALUE,
+        payloadCutWithMissile = !b.optBoolean("bombPumped", false),
     )
 }
 
@@ -524,7 +540,16 @@ private fun ShipAPI.capturePointDefense(): PointDefense? {
 private fun captureDemDroneBeam(drone: ShipAPI, out: MutableList<InFlightShot>) {
     val payload = drone.allWeapons.find { it.slot.id == "WS 001" } ?: drone.allWeapons.firstOrNull() ?: return
     if (!payload.isBeam || !(payload.isFiring || payload.chargeLevel > 0f)) return
-    val remaining = (if (payload.isBurstBeam) payload.burstFireTimeRemaining else 0.5f).coerceAtLeast(0.1f)
+    // full-power time left: the rest of the burst and a third of the charge-down, or what the fade still holds
+    // (b^3 x charge-down / 3, as captureWeapon's burst beams)
+    val down = (payload.spec as? BeamWeaponSpecAPI)?.chargedownTime ?: 0f
+    val fading = payload.beams?.maxOfOrNull { it.brightness } ?: 0f
+    val remaining = when {
+        !payload.isBurstBeam -> 0.5f
+        payload.isFiring && payload.burstFireTimeRemaining > 0f -> payload.burstFireTimeRemaining + down / 3f
+        else -> fading * fading * fading * down / 3f
+    }
+    if (remaining < 0.02f) return
     val dps = (payload.damage?.baseDamage ?: 0f) * drone.damageFactor(payload)
     val emp = payload.damage?.fluxComponent ?: 0f
     val a = Math.toRadians(drone.facing.toDouble())

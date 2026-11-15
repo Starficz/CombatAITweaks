@@ -30,16 +30,25 @@ import java.util.List;
 //  control:   the Hyperion removed, same flux     -> CAT vents (the restraint was the threat, not a broken vent)
 //  drone:     a Tempest 1300 away, guns blocked, its drone strike system free -> the prediction has the system's
 //             1200-damage hit from the Tempest itself, and CAT doesn't vent
+//  pursuit:   the aibattle Hound case (plan §14): a CAT Hound (no shield, default limits) at 90% hard flux, a Shrike
+//             (Plasma Burn on 1 of 2 charges, Heavy Blaster) 640 away, both free -> any vent CAT calls safe stays
+//             within its limits, and a burn on the last charge is captured running (not "out of ammo, never")
 public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
     private static final Logger log = Global.getLogger(VentCasesDriver.class);
+    private static final float HOUND_PARK_X = -9000f, HOUND_PARK_Y = 9000f, HOUND_X = -6000f, HOUND_Y = 3000f;
 
-    private enum Phase { WARMUP, CALM, CLEAR_1, TORPEDO_ARM, TORPEDO, CLEAR_2, BURN_ARM, BURN, CONTROL, CLEAR_3, DRONE_ARM, DRONE, DONE }
+    private enum Phase { WARMUP, CALM, CLEAR_1, TORPEDO_ARM, TORPEDO, CLEAR_2, BURN_ARM, BURN, CONTROL, CLEAR_3, DRONE_ARM, DRONE, PURSUIT_ARM, PURSUIT, DONE }
 
     private CombatEngineAPI engine;
     private boolean active;
     private int frame = 0, phaseStart = 0;
     private Phase phase = Phase.WARMUP;
-    private ShipAPI p, flag, parkedEnemy, jumper, tempest;
+    private ShipAPI p, flag, parkedEnemy, jumper, tempest, hound, shrike;
+    private final VentAudit audit = new VentAudit();
+    private boolean shrikeBurnedDuringVent = false;
+    private float closestDuringVent = Float.MAX_VALUE;
+    private String lastChargeBurn = null;
+    private boolean lastChargeBurnSeen = false;
     private boolean sawSystemHit = false;
     private CombatEntityAPI torpedo;
     private boolean ventedDuring = false, sawUnsafe = false;
@@ -82,7 +91,11 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
     }
 
     private String trace() {
-        Object t = p.getCustomData().get(VentController.TRACE);
+        return trace(p);
+    }
+
+    private static String trace(ShipAPI s) {
+        Object t = s.getCustomData().get(VentController.TRACE);
         return t == null ? "(no decision)" : t.toString();
     }
 
@@ -107,7 +120,9 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
             CombatFleetManagerAPI own = engine.getFleetManager(0), foe = engine.getFleetManager(1);
             for (FleetMemberAPI m : own.getReservesCopy()) {
                 boolean parked = m.getHullId().startsWith("ox");
-                own.spawnFleetMember(m, parked ? new Vector2f(-9000f, -9000f) : new Vector2f(0f, 0f), 90f, 0f);
+                boolean pursued = m.getHullId().startsWith("hound");
+                Vector2f at = parked ? new Vector2f(-9000f, -9000f) : pursued ? new Vector2f(HOUND_PARK_X, HOUND_PARK_Y) : new Vector2f(0f, 0f);
+                own.spawnFleetMember(m, at, 90f, 0f);
             }
             for (FleetMemberAPI m : foe.getReservesCopy()) foe.spawnFleetMember(m, new Vector2f(9000f, 9000f), 270f, 0f);
         }
@@ -119,9 +134,10 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
                 s.setCurrentCR(Math.max(s.getCurrentCR(), 0.7f));
                 if (s.getOwner() == 1) parkedEnemy = s;
                 else if (s.getHullSpec().getHullId().startsWith("ox")) flag = s;
+                else if (s.getHullSpec().getHullId().startsWith("hound")) hound = s;
                 else p = s;
             }
-            expect(p != null && flag != null && parkedEnemy != null, "ships deployed");
+            expect(p != null && flag != null && parkedEnemy != null && hound != null, "ships deployed");
             if (p == null) { finish(); return; }
             if (flag != null) engine.setPlayerShipExternal(flag);
         }
@@ -131,6 +147,18 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
         p.blockCommandForOneFrame(ShipCommand.USE_SYSTEM);
         pin(flag, -9000f, -9000f);
         pin(parkedEnemy, 9000f, 9000f);
+        if (phase.ordinal() < Phase.PURSUIT.ordinal()) {
+            if (phase == Phase.PURSUIT_ARM) {
+                // the predictor must see the Shrike before the flux rises (as in the other cases): both held a second
+                pin(hound, HOUND_X, HOUND_Y);
+                if (shrike != null && shrike.isAlive()) {
+                    pin(shrike, HOUND_X + 640f, HOUND_Y);
+                    shrike.blockCommandForOneFrame(ShipCommand.USE_SYSTEM);
+                    shrike.blockCommandForOneFrame(ShipCommand.FIRE);
+                }
+            } else pin(hound, HOUND_PARK_X, HOUND_PARK_Y);
+            if (hound != null) hound.blockCommandForOneFrame(ShipCommand.VENT_FLUX);
+        }
         if (tempest != null && tempest.isAlive()) {
             pin(tempest, 0f, 1300f);
             tempest.blockCommandForOneFrame(ShipCommand.FIRE);
@@ -242,6 +270,79 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
                     expect(sawSystemHit, "drone: the prediction has the drone strike's 1200 hit from the Tempest");
                     expect(!ventedDuring || (ventedTrace != null && ventedTrace.startsWith("VENT safe")),
                             "drone: no vent into the drone strike" + (ventedDuring ? " (vented: " + ventedTrace + ")" : ""));
+                    if (tempest != null) engine.removeEntity(tempest);
+                    tempest = null;
+                    enter(Phase.PURSUIT_ARM);
+                }
+                break;
+            }
+            case PURSUIT_ARM:
+                // place the Hound and the Shrike for the open: the Hound still parked (pinned) this frame
+                if (age() == 1) {
+                    hound.getLocation().set(HOUND_X, HOUND_Y);
+                    hound.getVelocity().set(0f, 0f);
+                    hound.setFacing(0f);
+                    shrike = engine.getFleetManager(1).spawnShipOrWing("shrike_Attack", new Vector2f(HOUND_X + 640f, HOUND_Y), 180f);
+                    expect(shrike != null, "pursuit: Shrike spawned 640 from the Hound");
+                    if (shrike != null) {
+                        shrike.setCurrentCR(Math.max(shrike.getCurrentCR(), 0.7f));
+                        // as in the aibattle case: Plasma Burn used before, one of its two charges left and the
+                        // other regenerating
+                        if (shrike.getSystem() != null) {
+                            shrike.getSystem().setAmmo(1);
+                            shrike.getSystem().setAmmoReloadProgress(0.3f);
+                        }
+                    }
+                }
+                if (age() >= 60) {
+                    float f = 0.9f * hound.getMaxFlux();
+                    hound.getFluxTracker().setCurrFlux(f);
+                    hound.getFluxTracker().setHardFlux(f);
+                    enter(Phase.PURSUIT);
+                }
+                break;
+            case PURSUIT: {
+                audit.track(engine, java.util.Collections.singletonList(hound));
+                boolean houndVenting = hound.isAlive() && hound.getFluxTracker().isVenting();
+                if (houndVenting && shrike != null && shrike.isAlive()) {
+                    if (shrike.getSystem() != null && shrike.getSystem().isOn()) shrikeBurnedDuringVent = true;
+                    closestDuringVent = Math.min(closestDuringVent,
+                            com.fs.starfarer.api.util.Misc.getDistance(hound.getLocation(), shrike.getLocation()));
+                }
+                if (age() % 30 == 0 && shrike != null) note("pursuit " + systemState());
+                // a burn on the Shrike's last charge: the capture must see it running and the charge coming back
+                if (lastChargeBurn == null && shrike != null && shrike.getSystem() != null && shrike.getSystem().isOutOfAmmo()
+                        && (shrike.getSystem().getState() == com.fs.starfarer.api.combat.ShipSystemAPI.SystemState.IN
+                        || shrike.getSystem().getState() == com.fs.starfarer.api.combat.ShipSystemAPI.SystemState.ACTIVE)) {
+                    org.starficz.combataitweaks.sim.SystemInfo c = capturedSystem();
+                    lastChargeBurn = systemState();
+                    lastChargeBurnSeen = c != null && c.getActiveLeft() > 0f && c.getReadyIn() < 60f;
+                }
+                if (age() % 60 == 0 && shrike != null) {
+                    Object t = hound.getCustomData().get(VentController.TRACE);
+                    note(String.format("pursuit %.1fs: gap %.0f, Hound flux %.2f venting %b, Shrike system %s; %s",
+                            age() / 60f, com.fs.starfarer.api.util.Misc.getDistance(hound.getLocation(), shrike.getLocation()),
+                            hound.getFluxLevel(), houndVenting, shrike.getSystem() == null ? "-" : shrike.getSystem().getState(),
+                            t == null ? "(no decision)" : t));
+                }
+                boolean ventDone = !audit.done.isEmpty();
+                if (ventDone || !hound.isAlive() || age() > 60 * 30) {
+                    if (audit.done.isEmpty()) {
+                        note("pursuit: the Hound didn't vent within 30 s (last decision: " + trace(hound) + ")");
+                        expect(true, "pursuit: no vent, nothing to judge");
+                    } else {
+                        VentAudit.Vent v = audit.done.get(0);
+                        note(String.format("pursuit: vent by %s, %s; armor lost %.0f (limit %.0f), hull lost %.0f (limit %.0f); "
+                                        + "closest Shrike %.0f, Shrike burned during it %b",
+                                v.byCat ? "CAT" : "vanilla", v.reason, v.armorLost, v.armorLimit, v.hullLost, v.hullLimit,
+                                closestDuringVent, shrikeBurnedDuringVent));
+                        expect(!v.overLimit(), "pursuit: a vent CAT calls safe stays within its limits ("
+                                + (v.safe ? "safe" : "not safe") + ", armor " + Math.round(v.armorLost) + "/" + Math.round(v.armorLimit)
+                                + ", hull " + Math.round(v.hullLost) + "/" + Math.round(v.hullLimit) + ")");
+                    }
+                    expect(lastChargeBurn != null && lastChargeBurnSeen,
+                            "pursuit: a burn on the last charge is captured running, ready when the charge regenerates ("
+                                    + (lastChargeBurn == null ? "no such burn" : lastChargeBurn) + ")");
                     finish();
                 }
                 break;
@@ -249,6 +350,27 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
             default:
                 break;
         }
+    }
+
+    // the Shrike's system live, and as the motion capture gives it to the sim
+    private String systemState() {
+        com.fs.starfarer.api.combat.ShipSystemAPI sys = shrike.getSystem();
+        if (sys == null) return "Shrike has no system";
+        org.starficz.combataitweaks.sim.SystemInfo captured = capturedSystem();
+        return String.format("%.2fs Shrike system %s ammo %d/%d reload %.2f cooldown %.2f outOfAmmo %b -> captured %s",
+                age() / 60f, sys.getState(), sys.getAmmo(), sys.getMaxAmmo(), sys.getAmmoReloadProgress(),
+                sys.getCooldownRemaining(), sys.isOutOfAmmo(),
+                captured == null ? "none" : String.format("readyIn %.2f burst %.0f active %.2f cooldown %.2f activeLeft %.2f",
+                        captured.getReadyIn(), captured.getBurstPotential(), captured.getActiveTime(), captured.getCooldown(),
+                        captured.getActiveLeft()));
+    }
+
+    private org.starficz.combataitweaks.sim.SystemInfo capturedSystem() {
+        for (org.starficz.combataitweaks.sim.SimShip s : org.starficz.combataitweaks.capture.MotionCaptureKt
+                .captureMotion(engine, java.util.Collections.singleton(hound.getId())).getShips()) {
+            if (s.getId().equals(shrike.getId())) return s.getSystem();
+        }
+        return null;
     }
 
     // a hit of the system's threat damage (1200) from the Tempest itself (not its drones) in the hold prediction

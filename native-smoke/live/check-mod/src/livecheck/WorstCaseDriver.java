@@ -59,6 +59,9 @@ public class WorstCaseDriver extends BaseEveryFrameCombatPlugin {
     private final List<float[]> rawEvents = new ArrayList<>();
     private final List<String> rawSources = new ArrayList<>(), rawDelivery = new ArrayList<>();
     private final Map<String, Float> predictedByDelivery = new TreeMap<>(), actualByDelivery = new TreeMap<>();
+    // of the predicted: conservative fire (limited-ammo shooters), which the defence model holds while the shield
+    // covers it, as vanilla's AI holds such missiles against shields; released only when the shield drops
+    private final Map<String, Float> heldByDelivery = new TreeMap<>();
     // per enemy: samples, venting or overloaded, beyond 1500 of the protected ship
     private final Map<String, int[]> enemyStates = new TreeMap<>();
     private float actualArmorTotal = 0f;
@@ -217,6 +220,7 @@ public class WorstCaseDriver extends BaseEveryFrameCombatPlugin {
                 if (h.getTime() < rel || h.getTime() >= rel + WINDOW) continue;
                 predictedBySource.merge(h.getSourceId(), h.getDamage(), Float::sum);
                 predictedByDelivery.merge(h.getDelivery().name(), h.getDamage(), Float::sum);
+                if (h.getConservative()) heldByDelivery.merge(h.getDelivery().name(), h.getDamage(), Float::sum);
             }
             windows.get(windows.size() - 1)[4] = -1f; // mark: count actual per source for this window
         }
@@ -303,8 +307,8 @@ public class WorstCaseDriver extends BaseEveryFrameCombatPlugin {
             note(String.format("  source %-28s predicted %8.0f  actual %8.0f", name,
                     predictedBySource.getOrDefault(s, 0f), actualBySource.getOrDefault(s, 0f)));
         }
-        for (String d : predictedByDelivery.keySet()) note(String.format("  delivery %-10s predicted %8.0f  actual %8.0f", d,
-                predictedByDelivery.get(d), actualByDelivery.getOrDefault(d, 0f)));
+        for (String d : predictedByDelivery.keySet()) note(String.format("  delivery %-10s predicted %8.0f (conservative %8.0f)  actual %8.0f", d,
+                predictedByDelivery.get(d), heldByDelivery.getOrDefault(d, 0f), actualByDelivery.getOrDefault(d, 0f)));
         note(String.format("armor damage actual (all windows, overlapping): %.0f", actualArmorTotal));
         for (Map.Entry<String, int[]> e : enemyStates.entrySet()) {
             int[] st = e.getValue();

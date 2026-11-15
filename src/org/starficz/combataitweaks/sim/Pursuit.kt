@@ -28,7 +28,7 @@ object Pursuit {
         val dist = length(dx, dy)
         val reach = enemy.weaponReach + enemy.collisionRadius + targetingRadius
         val sys = enemy.system
-        val sysReady = sys != null && sys.readyIn < window && enemy.silenceTime < 3f
+        val sysReady = sys != null && (sys.readyIn < window || sys.activeLeft > 0f) && enemy.silenceTime < 3f
         val gap = dist - reach - (if (sysReady) sys!!.burstPotential else 0f)
         if (gap <= 0f) return enemy.silenceTime
 
@@ -100,7 +100,7 @@ object Pursuit {
      */
     fun clearDistance(enemy: SimShip, target: SimShip, targetingRadius: Float, params: SimParams): Float {
         val sys = enemy.system
-        val sysReady = sys != null && sys.readyIn < params.commitWindow && enemy.silenceTime < 3f
+        val sysReady = sys != null && (sys.readyIn < params.commitWindow || sys.activeLeft > 0f) && enemy.silenceTime < 3f
         var speed = enemy.cruiseSpeed + (if (sysReady) sys!!.activeSpeedIncrease else 0f)
         if (enemy.isPhaseShip && enemy.hardFluxLevel < 0.2f) speed *= 2f
         val reach = enemy.weaponReach + enemy.collisionRadius + targetingRadius +
@@ -127,13 +127,11 @@ object Pursuit {
         val body = Body(ship)
         private var retreatDone = false
         private val base = EngineLimits(ship)
-        private var systemStart = -1f
+        /** End of the system's effect on the shared clock: already on at the snapshot, or fired in the sim. */
+        private var systemActiveUntil = ship.system?.activeLeft ?: 0f
         private var systemReadyAt = ship.system?.readyIn ?: Float.MAX_VALUE
 
-        fun isSystemActive(t: Float): Boolean {
-            val sys = ship.system ?: return false
-            return systemStart >= 0f && t < systemStart + sys.activeTime
-        }
+        fun isSystemActive(t: Float): Boolean = ship.system != null && t < systemActiveUntil
 
         // the two limits a pursuer can have (system active or not), built once: limitsAt runs every step
         private val plainLimits = limitsWith(false)
@@ -199,7 +197,7 @@ object Pursuit {
                 val moves = sys.burstPotential > 0f || sys.activeSpeedIncrease > 0f
                 val worthIt = if (sys.burstPotential > 0f) toDist > sys.burstPotential * 0.5f else toDist > 300f
                 if (moves && worthIt) {
-                    systemStart = t
+                    systemActiveUntil = t + sys.activeTime
                     systemReadyAt = t + sys.activeTime + sys.cooldown
                 }
             }

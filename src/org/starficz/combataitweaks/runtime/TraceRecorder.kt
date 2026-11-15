@@ -41,6 +41,7 @@ import java.util.IdentityHashMap
  * - `in`: the missiles and shots the predictor was given for a batch (what the capture saw).
  * - `pred`: a CAT ship's newest hold-branch prediction, at most every [PRED_EVERY] s: its path, the committed
  *   enemies and their paths, the predicted hits binned by shooter, and the defence outcome with and without venting.
+ * - `predo`: the same for the batch's other vent option (`BACK_OFF`, field `opt`), when it was predicted.
  */
 class TraceRecorder private constructor() {
 
@@ -80,6 +81,9 @@ class TraceRecorder private constructor() {
             lastPred[s.id] = now
             lastPredStart[s.id] = hold.outlook.startTime
             recordPrediction(now, s, hold)
+            predictor.latestResult(s.id, PredictorManager.BACK_OFF)
+                ?.takeIf { it.outlook.startTime == hold.outlook.startTime }
+                ?.let { recordPrediction(now, s, it, "predo") }
         }
         if (now - lastFlush >= FLUSH_EVERY || engine.isCombatOver) {
             lastFlush = now
@@ -99,6 +103,12 @@ class TraceRecorder private constructor() {
             .num("hp", s.hitpoints, 0).bool("vent", ft.isVenting).bool("ovl", ft.isOverloaded)
             .bool("sh", s.shield?.isOn == true).num("shf", s.shield?.facing ?: Float.NaN, 0)
             .bool("sys", s.system?.isActive == true)
+        // the system as the motion capture reads it: state, charges (max > 1 only), cooldown left
+        s.system?.let { sys ->
+            l.str("sst", sys.state.name)
+            if (sys.maxAmmo in 2 until Int.MAX_VALUE) l.int("sam", sys.ammo)
+            if (sys.cooldownRemaining > 0f) l.num("scd", sys.cooldownRemaining, 2)
+        }
         s.shipAI?.aiFlags?.let { flags ->
             VanillaTarget.of(s)?.let { l.str("mt", it.id) }
             // the target of the maneuver vanilla's sequence switched to in the last second, if any
@@ -192,9 +202,10 @@ class TraceRecorder private constructor() {
         emit(l.end())
     }
 
-    private fun recordPrediction(now: Float, ship: ShipAPI, hold: RequestResult) {
+    private fun recordPrediction(now: Float, ship: ShipAPI, hold: RequestResult, kind: String = "pred") {
         val result = hold.outlook.result
-        val l = line.begin("pred", now).str("id", ship.id).num("start", hold.outlook.startTime, 2)
+        val l = line.begin(kind, now).str("id", ship.id).num("start", hold.outlook.startTime, 2)
+        if (kind != "pred") l.str("opt", hold.name)
         l.path("path", hold.shipTimeline)
         l.raw("committed") { sb ->
             sb.append('{')

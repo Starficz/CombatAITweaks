@@ -1,5 +1,6 @@
 package org.starficz.combataitweaks.capture
 
+import kotlin.math.max
 import com.fs.starfarer.api.Global
 import com.fs.starfarer.api.combat.CombatAssignmentType
 import com.fs.starfarer.api.combat.CombatEngineAPI
@@ -175,20 +176,26 @@ private fun ShipSystemAPI.toSystemInfo(): SystemInfo? {
     val burst = hints.burstMovementPotential
     val speed = hints.activeSpeedIncrease
     if (burst <= 0f && speed <= 0f) return null
-    val usable = !isOutOfAmmo
-    val readyIn = when {
-        !usable -> Float.MAX_VALUE
-        state == ShipSystemAPI.SystemState.IDLE -> 0f
-        state == ShipSystemAPI.SystemState.COOLDOWN -> cooldownRemaining
+    // out of charges: usable again when the next one regenerates (as the damage capture's system threats); a burn
+    // on its last charge is out of ammo while it runs, and used to read as never usable, the burn itself unseen
+    val reload = if (isOutOfAmmo) {
+        if (ammoPerSecond <= 0f) Float.MAX_VALUE else (1f - ammoReloadProgress) / ammoPerSecond
+    } else 0f
+    val on = state == ShipSystemAPI.SystemState.IN || state == ShipSystemAPI.SystemState.ACTIVE
+    val readyIn = when (state) {
+        ShipSystemAPI.SystemState.IDLE -> 0f
+        ShipSystemAPI.SystemState.COOLDOWN -> cooldownRemaining
         else -> getOnTimeRemaining() + cooldown
     }
-    val activeTime = if (specAPI.isToggle) TOGGLE_ACTIVE_TIME else chargeUpDur + chargeActiveDur
+    val activeTime = (if (specAPI.isToggle) TOGGLE_ACTIVE_TIME else chargeUpDur + chargeActiveDur).coerceAtLeast(0.1f)
     return SystemInfo(
-        readyIn = readyIn,
-        activeTime = activeTime.coerceAtLeast(0.1f),
+        readyIn = max(readyIn, reload),
+        activeTime = activeTime,
         cooldown = chargeDownDur + cooldown,
         burstPotential = burst,
         activeSpeedIncrease = speed,
+        // already on at the snapshot: the charge-up and active time still to come (the charge-down doesn't move it)
+        activeLeft = if (on) (getOnTimeRemaining() - chargeDownDur).coerceIn(0f, activeTime) else 0f,
     )
 }
 

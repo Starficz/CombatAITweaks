@@ -23,6 +23,8 @@ class SystemInfo(
     val burstPotential: Float,
     /** Extra max speed while active. */
     val activeSpeedIncrease: Float,
+    /** Seconds of the effect still to come when it is already on at the snapshot (charge up + active); 0 = off. */
+    val activeLeft: Float = 0f,
 )
 
 /** Everything the movement model needs about one ship, captured once per batch. Immutable. */

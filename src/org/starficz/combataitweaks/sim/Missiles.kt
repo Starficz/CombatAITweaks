@@ -89,7 +89,8 @@ class MissileSim(
         val track = pdFire?.track(m.hitpoints, m.radius)
         for (i in 0 until steps) {
             if (f.flight < 0f) { f.flight += DT; continue }
-            if (f.flight >= lifespan) return
+            // a triggered DEM flies on until its sequence ends (DEMScript sets its flight time to 10000)
+            if (f.flight >= lifespan && f.dem == DemState.WAIT) return
             if (track != null && track.destroyedAt(i)) { intercepted++; return }
             f.pvx = f.vx; f.pvy = f.vy
             val tx = timeline.x[i]; val ty = timeline.y[i]
@@ -241,30 +242,39 @@ class MissileSim(
                 if (f.demElapsed >= p.targetingTime) { f.dem = DemState.FIRE; f.demElapsed = 0f }
             }
             DemState.FIRE -> {
-                demPayload(f, p, time)
-                return true
+                val surface = dist - target.hitRadius
+                // bomb-pumped: the whole payload at once, nothing can cut it
+                if (!p.payloadCutWithMissile) { demPayload(f, p, time, surface, f.demElapsed, Float.MAX_VALUE); return true }
+                // otherwise this step's ticks only, holding station: point defense killing it cuts the rest
+                demMove(f, p, dist, bearing)
+                demPayload(f, p, time, surface, f.demElapsed, f.demElapsed + DT)
+                f.demElapsed += DT
+                return f.demElapsed >= p.payloadStart + p.payloadDuration - 1e-4f
             }
             else -> return true
         }
         return false
     }
 
-    private fun demPayload(f: Flight, p: DemInfo, time: Float) {
+    /** The payload ticks due from [from] to [to] seconds into the firing (the ones before are already fired). */
+    private fun demPayload(f: Flight, p: DemInfo, time: Float, surface: Float, from: Float, to: Float) {
         val m = f.m
+        if (surface > p.payloadRange) return
         if (!p.payloadIsBeam) {
-            if (f.demElapsed <= 0f) hits += pool.hit(
+            if (from <= 0f) hits += pool.hit(
                 time = time, damage = p.payloadDamage, hitStrength = p.payloadDamage, emp = p.payloadEmp,
                 kind = p.payloadKind, delivery = Delivery.PROJECTILE, softFlux = false,
                 conservative = m.conservative, fromX = f.x, fromY = f.y, sourceId = m.sourceId,
             )
             return
         }
-        // beam payload: DPS for the firing time, in beam ticks; the ones already fired are skipped
-        var t = 0f
-        while (t < p.firingTime - 1e-4f) {
-            val tick = min(FireControl.BEAM_TICK, p.firingTime - t)
-            if (t >= f.demElapsed) hits += pool.hit(
-                time = time + (t - f.demElapsed), damage = p.payloadDamage * tick, hitStrength = p.payloadDamage,
+        // beam payload: DPS over its full-power time, in beam ticks; the ones already fired are skipped
+        val end = min(p.payloadStart + p.payloadDuration, to)
+        var t = p.payloadStart
+        while (t < end - 1e-4f) {
+            val tick = min(FireControl.BEAM_TICK, p.payloadStart + p.payloadDuration - t)
+            if (t >= from - 1e-4f) hits += pool.hit(
+                time = time + (t - from), damage = p.payloadDamage * tick, hitStrength = p.payloadDamage,
                 emp = p.payloadEmp * tick, kind = p.payloadKind, delivery = Delivery.BEAM,
                 softFlux = p.payloadSoftFlux, conservative = m.conservative, fromX = f.x, fromY = f.y,
                 sourceId = m.sourceId,

@@ -1144,6 +1144,41 @@ Noted 2026-11-14 at the user's request; not planned yet.
     (`captureDemDroneBeam`) and the missile in its FIRE state. A DEM missile firing or done is now left out; its
     drone carries the rest of the payload. `worstcase`: 15.2k predicted against 8.8k actual, then 16.6k against
     6.9k, so about 2× over instead of 4×. What is left is for the per-DEM audit (geometry, launch timing, PD).
+  - **Per-DEM audit, 2026-11-15** (`worstcase`, Gorgons from a `hammerhead_DEM` at a Dominator; the trace's drone
+    beam ticks per DEM):
+    - **The payload model.** All four vanilla DEM payloads are burst beams. Gorgon: 800 DPS, 0.05 s charge-up,
+      0.9 s burst, 0.25 s charge-down. Damage follows brightness squared (the beam ramps above), so a Gorgon payload
+      is 800 × (0.9 + 0.3 / 3) = 800, and the trace shows exactly that: a ramp of 12.8 and 33, then 80 per 0.1 s
+      tick. The sim dealt the DPS for the whole firing time (1000; a Dragonfire 8000 instead of 4000). Now
+      `DemInfo.payloadStart` / `payloadDuration` carry the burst with a third of the ramps, the captured drone beam
+      adds its charge-down third (or what its fade still holds), and a tick out of the payload's range deals nothing.
+    - **PD cuts a firing DEM.** Vanilla's `DEMScript` removes the drone when the missile dies, also while it fires
+      (unless `bombPumped`: the missile is gone at once and the drone fires on). In `worstcase` 3 of 16 Gorgons
+      delivered nothing and several only part, at 25–150 of their 250 hp. The sim dealt the whole payload the moment
+      firing started. Now a firing DEM holds station as a PD target and deals each step's ticks only while alive.
+      A triggered DEM also no longer expires on its flight time (vanilla sets it to 10000).
+    - **Launch timing.** From 12 s to 55 s every prediction had the Hammerhead launching Gorgons; it launched none
+      until 55 s, about 760 away. Vanilla's manual missile fire (translation of obfuscated code:
+      `combat.ai.attack.AttackAIModule`) holds limited, non-kinetic missiles while the target's shield could take
+      1.25 × the group's volley (its free flux plus half the dissipation over the flight time) and either its shield
+      is up and covers the shooter (active arc + 130°), the shooter is in its front 120°, or it is beyond 500 +
+      radius (400 for omni shields). It fires them as finishers: on high flux, overload or vent, or from behind
+      close in. The sim's `conservative` flag already holds these hits while P's shield covers them and releases
+      them when it drops, so the after-defence prediction follows this. The `worstcase` raw totals counted them,
+      though: the report now shows the conservative part per delivery.
+    - **Barrels:** the Hydra payload has two barrels ([0, 0]). Whether a multi-barrel beam's DPS is per barrel isn't
+      verified: the Paladin PD's 1000 DPS over five barrels suggests it is the total. Left as one beam.
+    - **Result** (`worstcase`, one run each; the fights differ):
+
+      | | DEM beam predicted (conservative) | actual | over |
+      |---|---|---|---|
+      | before (DEM double count fixed) | 20.6k (–) | 7.2k | 2.9× |
+      | payload model | 17.2k (1.6k) | 7.2k | 2.4× (2.2× without the held part) |
+      | + PD cuts the firing DEM | 16.2k (1.8k) | 9.9k | 1.6× (1.45×) |
+
+      Actual per firing DEM in the last run: 764 of 800. What is left: the sim predicts somewhat more DEMs reaching
+      their payload than vanilla delivers (its PD on station-keeping DEMs is a little weak), which is conservative.
+      Unit tests 290 (payload 800, ticks, range, PD cut, bomb-pumped); `aibattle` 14/14.
   - **Missile flight cost:** `MissileSim.guided` computed an atan2 on every step of every missile to test "flying
     more than 90° off its facing"; a dot product says the same. `fastAtan2` fell from 28% to 15% of CAT's CPU in a
     missile-heavy `aibattle`.
@@ -1175,3 +1210,31 @@ Noted 2026-11-14 at the user's request; not planned yet.
 - **Vent pursuit** (found 2026-11-14 in `aibattle`): a Hound vented "safe" (predicted 2 armor, 27 hull) and took
   69 armor and 350 hull, two 500-damage energy hits from a Shrike that caught it while it backed off venting. The vent
   prediction has no PD by design, so it's the back-off-while-venting path or the pursuit model.
+
+  **Found and fixed 2026-11-15: the capture, not the pursuit.**
+  - **What happened:** the Shrike's Plasma Burn (2 charges, one per 10 s) started on its last charge between two
+    trace samples, just before the 122.82 s batch. A system on its last charge is out of ammo while it runs, and the
+    motion capture read that as never usable (`readyIn` = MAX). A system already on at the snapshot wasn't modelled at
+    all. So the sim's Shrike fell behind the fleeing Hound, and the vent read as safe.
+  - **How it was found:** the trace showed the Shrike burning (speed 120 → 580, 639 → 388 in 1 s) the moment the
+    Hound vented, and BACK_OFF jumping to 1244 predicted hull once the burn was captured. A unit test at the trace's
+    snapshot gives 29 hull within the 3.9 s window with the system unusable (the battle predicted 27) and 680 with it
+    ready.
+  - **Vanilla's side** (translation of obfuscated code: `combat.ai.system.a`, the burn drive AI, which Plasma Burn
+    uses): a short-burst system (burst > 0, no speed hint, active ≤ 1 s) treats a target venting or overloaded for
+    more than 1 s as fair game even when it would otherwise hold back. It burns in when farther than the burst + 0.75
+    × radii, its own flux is under 0.65 and 0.2 below the target's, and the target is smaller or the same size. The
+    sim's pursuers already burn whenever the gap is worth it, so nothing changes there.
+  - **Fix:**
+    - out of charges: ready when the next one regenerates, (1 − reload progress) / ammo per second, as the damage
+      capture's system threats already did; never only when it doesn't regenerate;
+    - `SystemInfo.activeLeft`: a system on at the snapshot (IN or ACTIVE) keeps its effect for the charge-up and
+      active time still to come, in the pursuit and in the commit and clear-range checks.
+  - **Tests:** unit tests at the snapshot (unusable: falls behind; ready: catches; already burning: catches).
+    `ventcases` has a pursuit case: a CAT Hound with the default limits at 90% hard flux, a `shrike_Attack` 640 away on
+    1 of 2 charges, both free. It checks that a safe vent stays within its limits, and that a burn on the last charge
+    is captured running and ready when the charge comes back.
+  - **Checked:** unit tests 285; `ventcases` 15/15 (CAT waited out the Shrike and vented at 1226 mid-burn, predicting
+    nothing; the Shrike burned twice and got no closer than 700); `aibattle` 14/14, 2 vents, none over.
+  - **Trace:** ship records now carry the system state (`sst`, charges `sam`, cooldown `scd`), and `predo` records
+    the BACK_OFF branch next to `pred` (the vent's other option).
