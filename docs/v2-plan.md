@@ -1096,3 +1096,64 @@ Noted 2026-11-14 at the user's request; not planned yet.
   enemies are over-predicted (DEM payloads about 2×). Modelling it properly means modelling PD accuracy, which is
   hard. Start with a simple correction heuristic (an expected interception share per missile from P's PD DPS in
   range and the missile's HP), and judge from the trace whether more is worth it.
+
+  **Built 2026-11-14** (`sim/PointDefense.kt`), with vanilla's aim, because the user pointed out its lead is poor.
+  - **Vanilla's lead** (translation of obfuscated code: `combat.ai.N`, the lead point the autofire AI `combat.ai.P`
+    aims at):
+    - an intercept on the missile's current velocity relative to the ship, from the ship's centre, with the
+      distance less 0.75 × both radii;
+    - every speed is multiplied by k = 2 − the ship's autofire aim accuracy (0 without skills, so k = 2: it leads
+      by about half the true flight time), minus the weapon's `autofireAccBonus` (blank on every vanilla weapon);
+    - k drops by 1/15 per second the weapon has fired at the same target, at least 1. It is 1 for PD weapons on
+      ships with `pd_best_target_leading` (Integrated Point Defense AI; Gunnery Implants gives autofire accuracy
+      +100% instead);
+    - acceleration and turning are never led.
+  - **Per shot:**
+    - the miss is the closest approach of the shot (ship velocity plus muzzle speed toward that aim point, from
+      the mount) to the missile carrying on with this step's acceleration;
+    - the hit chance is that miss against the spread cone at that distance, over the missile's width (its radius
+      + 5);
+    - it is multiplied by how well the turret tracks the missile's angular rate. Beams count tracking only.
+  - **Per missile run:**
+    - P's PD and PD_ONLY weapons (not STRIKE, not PD_ALSO) each engage one missile at a time, after 0.3 s in
+      range and arc, and stay on it while it lives;
+    - the expected damage lands after the shot's flight time;
+    - a missile whose hitpoints (live, or the spec's) run out never arrives.
+  - **Both ways:** P's PD against incoming missiles, enemies' PD against P's missiles (the trade), and against the
+    side's missiles.
+  - **Never while venting:** the vent-now run has no PD.
+  - **A/B switch:** `CAT_PD=false` in the checks (`-Dcat.pd=false`).
+  - **Tests:** unit tests for a missile flying straight in (hit even at k = 2), a crossing missile (missed at k = 2,
+    hit at k = 1), acceleration not led, spread and tracking, interception in a run (light missile down, heavy one
+    through, a weapon facing away doesn't help, one weapon one missile at a time), and no PD while venting.
+  - **Measured** (`trace_report.py` "Point defense", DEMs left out of both): the share of missiles aimed at CAT
+    ships that were shot down, actual against predicted:
+    - `aibattle` runs: 0.40 against 0.31 (21 missiles), and 0.11 against 0.08 (35);
+    - `worstcase`: the missile-in-flight over-prediction (4000 against 0) went away.
+    - So the prediction stays a little conservative, as intended.
+  - **Cost:** the first version doubled batch time (62 ms); the arc check ran on every step of every missile's
+    flight. Range first, a reach cull and lazy tracking brought it back to 33 ms.
+  - **Still open:**
+    - Flak's proximity fuse hits far wider than the 5 unit shot radius;
+    - PD_ALSO weapons and fighters as targets;
+    - PD weapons firing at ships in the same branch are counted for both;
+    - DEM payloads: the Gorgon's drones fire from beyond most PD (Vulcans reach 250), and its payload beams were
+      about 3.8× over-predicted in `worstcase` (19.8k against 5.2k). That is the DEM model, not PD.
+  - **DEM double count, fixed 2026-11-14.** Vanilla's `DEMScript` spawns a `dem_drone` with the payload at the
+    trigger and keeps the missile alive while the drone fires. The capture counted both: the drone's beam
+    (`captureDemDroneBeam`) and the missile in its FIRE state. A DEM missile firing or done is now left out; its
+    drone carries the rest of the payload. `worstcase`: 15.2k predicted against 8.8k actual, then 16.6k against
+    6.9k, so about 2× over instead of 4×. What is left is for the per-DEM audit (geometry, launch timing, PD).
+  - **Missile flight cost:** `MissileSim.guided` computed an atan2 on every step of every missile to test "flying
+    more than 90° off its facing"; a dot product says the same. `fastAtan2` fell from 28% to 15% of CAT's CPU in a
+    missile-heavy `aibattle`.
+- **Beam ramps** (found 2026-11-14, `aibattle` vent audit, 2 of 3 safe vents over their limits):
+  - a Lasher vented "safe" (predicted 0 armor) and lost 199 armor to an Anubis burst beam fading out: ticks of
+    112, 87, 66, 47, 33, 22, 9, 6 (382 raw). The sim deals no beam damage outside a burst's full-power part, so a
+    beam charging down at the snapshot predicts nothing;
+  - a Lasher vented at 28 of its 30 armor limit and lost 61 to a Shrike's beams.
+  - Next: model burst beams' charge-up and charge-down damage (vanilla scales beam damage by its brightness;
+    **(verify)** the curve in the beam code), and capture beams still fading at the snapshot.
+- **Vent pursuit** (found 2026-11-14 in `aibattle`): a Hound vented "safe" (predicted 2 armor, 27 hull) and took
+  69 armor and 350 hull, two 500-damage energy hits from a Shrike that caught it while it backed off venting. The vent
+  prediction has no PD by design, so it's the back-off-while-venting path or the pursuit model.

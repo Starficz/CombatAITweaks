@@ -25,7 +25,20 @@ class MissileSim(
     private val timeline: Timeline,
     /** Where its hits come from; null: new ones. */
     private val pool: Scratch? = null,
+    /** The target's point defense (plan §14); null: none modelled (venting, or not captured). */
+    pd: PointDefense? = null,
 ) {
+    private val pdFire = pd?.takeIf { it.weapons.isNotEmpty() }?.let { PdFire(it, timeline, pool) }
+
+    /**
+     * Missiles point defense destroyed before they arrived, and missiles that hit, in this run (tests, trace); DEMs
+     * aren't counted (their payload fires from range).
+     */
+    var intercepted = 0
+        private set
+    var arrived = 0
+        private set
+
     private val steps = timeline.steps
 
     val hits = ArrayList<Hit>()
@@ -46,6 +59,7 @@ class MissileSim(
         var flight = m.flightTime
         var dem = m.demState
         var demElapsed = m.demElapsed
+        var pvx = m.vx; var pvy = m.vy
     }
 
     fun run(missiles: List<InFlightMissile>) {
@@ -56,7 +70,15 @@ class MissileSim(
             queue += m
         }
         val subShots = ArrayList<InFlightShot>()
-        while (queue.isNotEmpty()) simulate(Flight(queue.removeFirst()), queue, subShots)
+        while (queue.isNotEmpty()) {
+            val before = hits.size
+            val m = queue.removeFirst()
+            val stopped = intercepted
+            simulate(Flight(m), queue, subShots)
+            // the counts leave DEMs out: their drones fire from range, the missile itself never hits
+            if (m.info.dem != null) intercepted = stopped
+            else if (hits.size > before) arrived++
+        }
         if (subShots.isNotEmpty()) shoot(subShots, IN_FLIGHT)
     }
 
@@ -64,9 +86,12 @@ class MissileSim(
         val m = f.m
         val info = m.info
         val lifespan = info.maxFlightTime + info.flameoutTime
+        val track = pdFire?.track(m.hitpoints, m.radius)
         for (i in 0 until steps) {
             if (f.flight < 0f) { f.flight += DT; continue }
             if (f.flight >= lifespan) return
+            if (track != null && track.destroyedAt(i)) { intercepted++; return }
+            f.pvx = f.vx; f.pvy = f.vy
             val tx = timeline.x[i]; val ty = timeline.y[i]
             val tvx = FireControl.velocityX(timeline, i)
             val tvy = FireControl.velocityY(timeline, i)
@@ -94,6 +119,7 @@ class MissileSim(
                 }
             }
             if (done) return
+            track?.engage(i, f.x, f.y, f.vx, f.vy, (f.vx - f.pvx) / DT, (f.vy - f.pvy) / DT)
             if (tracksMissiles && powered && dist < 600f && dist < missileDistance[i]) {
                 missileDistance[i] = dist
                 missileBearing[i] = angleOf(f.x - tx, f.y - ty)
@@ -172,8 +198,9 @@ class MissileSim(
             val a = f.facing * DEG_TO_RAD
             val fx = cos(a); val fy = sin(a)
             val speed = sqrt(f.vx * f.vx + f.vy * f.vy)
-            val offFacing = if (speed > 1f) abs(shortestRotation(f.facing, angleOf(f.vx, f.vy))) else 0f
-            if (offFacing > 90f && speed > 0f) {
+            // flying more than 90 degrees off its facing: the dot product says it without an atan2 per step
+            val backwards = speed > 1f && fx * f.vx + fy * f.vy < 0f
+            if (backwards) {
                 val brake = min(speed, info.acceleration * DT)
                 f.vx -= f.vx / speed * brake; f.vy -= f.vy / speed * brake
             } else {

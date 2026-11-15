@@ -133,7 +133,7 @@ class TraceRecorder private constructor() {
             emit(line.begin("msl", now).int("id", missileId(m)).str("spec", m.projectileSpecId).int("own", m.owner)
                 .num("x", m.location.x).num("y", m.location.y).num("vx", m.velocity.x).num("vy", m.velocity.y)
                 .num("f", m.facing).str("tgt", target?.id).num("ft", m.flightTime, 2).num("mft", m.maxFlightTime, 2)
-                .num("turn", m.maxTurnRate, 0).str("src", m.source?.id).end())
+                .num("turn", m.maxTurnRate, 0).str("src", m.source?.id).num("hp", m.hitpoints, 0).end())
         }
     }
 
@@ -214,6 +214,8 @@ class TraceRecorder private constructor() {
             sb.append('}')
         }
         if (result != null) {
+            // point defense (plan §14): missiles at the ship shot down, and missiles that hit
+            l.int("pdk", result.intercepted).int("pdn", result.arrived)
             // predicted hits, binned per 0.5 s per shooter and delivery
             val bins = HashMap<String, FloatArray>()
             val nBins = (result.normal.steps * DT / BIN).toInt() + 1

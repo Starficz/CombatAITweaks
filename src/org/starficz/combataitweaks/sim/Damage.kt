@@ -11,6 +11,8 @@ class DamageInputs(
      */
     val defenses: Map<String, SimDefense>,
     val rules: DamageRules = DamageRules(),
+    /** Point defense of the ships with captured defences, by ship id (plan §14): it shoots missiles at them. */
+    val pointDefense: Map<String, PointDefense> = emptyMap(),
 ) {
     val shooterById: Map<String, SimShooter> = shooters.associateBy { it.shipId }
 }
@@ -46,9 +48,13 @@ class DamageResult(
     val defense: SimDefense,
     /** Each enemy the ship fired at; null when the trade wasn't asked for. */
     val dealt: List<TargetOutcome>? = null,
+    /** Missiles at the ship its point defense shot down, and missiles that hit it (plan §14; for the trace). */
+    val intercepted: Int = 0,
+    val arrived: Int = 0,
 ) {
     /** This result with [ventNow] replaced (a branch re-run with reactions keeps the first run's vent, §13.8). */
-    fun withVentNow(ventNow: DefenseOutcome?) = DamageResult(hits, normal, ventNow, omniFacing, defense, dealt)
+    fun withVentNow(ventNow: DefenseOutcome?) =
+        DamageResult(hits, normal, ventNow, omniFacing, defense, dealt, intercepted, arrived)
 }
 
 /** One option's branch as the decisions read it: the final paths, the damage, and how enemies reacted. */
@@ -148,6 +154,8 @@ object DamageSim {
             omniFacing = if (detail) omni else noFacing(timeline.steps),
             defense = defense,
             dealt = dealt,
+            intercepted = missiles.intercepted,
+            arrived = missiles.arrived,
         )
     }
 
@@ -173,7 +181,8 @@ object DamageSim {
             fire.fire(shooter, tl, quiet, discipline, coupling.pressure[shooter.shipId], shooter.shipId in recordFlux)
             fire.fireSystem(shooter, tl, quiet)
         }
-        val missiles = MissileSim(defense, owner, timeline, pool)
+        val missiles = MissileSim(defense, owner, timeline, pool,
+            if (disciplined) inputs.pointDefense[defense.shipId] else null)
         missiles.run(if (fire.launched.isEmpty()) inputs.missiles else inputs.missiles + fire.launched)
         missiles.shoot(inputs.shots)
 
@@ -222,7 +231,7 @@ object DamageSim {
         val def = sink.target
         val all = ArrayList<Hit>(sink.hits)
         if (sink.launched.isNotEmpty()) {
-            val m = MissileSim(def, def.owner, sink.targetTimeline, pool)
+            val m = MissileSim(def, def.owner, sink.targetTimeline, pool, inputs.pointDefense[def.shipId])
             m.run(sink.launched)
             all += m.hits
         }
@@ -274,7 +283,8 @@ object SideFire {
         for (sink in sinks) {
             val hits = ArrayList<Hit>(sink.hits)
             if (sink.launched.isNotEmpty()) {
-                val m = MissileSim(sink.target, sink.target.owner, sink.targetTimeline)
+                val m = MissileSim(sink.target, sink.target.owner, sink.targetTimeline,
+                    pd = inputs.pointDefense[sink.target.shipId])
                 m.run(sink.launched)
                 hits += m.hits
             }

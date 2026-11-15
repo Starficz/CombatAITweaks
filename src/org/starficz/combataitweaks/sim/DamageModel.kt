@@ -160,6 +160,9 @@ class MissileInfo(
     val mineRange: Float = 0f,
     val mirv: MirvInfo? = null,
     val dem: DemInfo? = null,
+    /** Hitpoints (the missile's hull spec) and collision radius, for point defense; 0 hitpoints = unknown. */
+    val hitpoints: Float = 0f,
+    val radius: Float = 15f,
 )
 
 /** A MIRV's split rules (vanilla MirvAI) and what it splits into. Random ranges are replaced by their midpoints. */
@@ -333,6 +336,9 @@ class InFlightMissile(
     val demState: DemState = DemState.WAIT,
     val demElapsed: Float = 0f,
     val sourceId: String = IN_FLIGHT,
+    /** Hitpoints left (a missile in flight may be damaged already) and collision radius, for point defense. */
+    val hitpoints: Float = info.hitpoints,
+    val radius: Float = info.radius,
 )
 
 const val IN_FLIGHT = "in flight"

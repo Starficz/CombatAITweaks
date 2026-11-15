@@ -11,6 +11,7 @@ import com.fs.starfarer.api.combat.ShipAPI
 import com.fs.starfarer.api.combat.ShipSystemAPI
 import com.fs.starfarer.api.combat.StatBonus
 import com.fs.starfarer.api.combat.WeaponAPI
+import com.fs.starfarer.api.impl.campaign.ids.Stats
 import com.fs.starfarer.api.impl.combat.dem.DEMScript
 import com.fs.starfarer.api.loading.BeamWeaponSpecAPI
 import com.fs.starfarer.api.loading.MissileSpecAPI
@@ -33,6 +34,8 @@ import org.starficz.combataitweaks.sim.InFlightMissile
 import org.starficz.combataitweaks.sim.InFlightShot
 import org.starficz.combataitweaks.sim.MirvInfo
 import org.starficz.combataitweaks.sim.MissileInfo
+import org.starficz.combataitweaks.sim.PdWeapon
+import org.starficz.combataitweaks.sim.PointDefense
 import org.starficz.combataitweaks.sim.ShieldKind
 import org.starficz.combataitweaks.sim.SimDefense
 import org.starficz.combataitweaks.sim.SimShooter
@@ -91,6 +94,14 @@ fun CombatEngineAPI.captureDamage(protectedIds: Set<String>): DamageInputs {
         if (near) defenses[ship.id] = ship.toDefense(withModules = true)
     }
 
+    // point defense of every ship with captured defences: it shoots the missiles fired at it (plan §14)
+    val shipById = ships.associateBy { it.id }
+    val pointDefense = HashMap<String, PointDefense>()
+    // -Dcat.pd=false leaves it out (A/B runs in the checks)
+    if (System.getProperty("cat.pd") != "false") {
+        for (id in defenses.keys) shipById[id]?.capturePointDefense()?.let { pointDefense[id] = it }
+    }
+
     val missiles = ArrayList<InFlightMissile>()
     for (proj in projectiles) {
         if (proj.isFading || proj.isExpired) continue
@@ -111,7 +122,7 @@ fun CombatEngineAPI.captureDamage(protectedIds: Set<String>): DamageInputs {
             timeLeft = timeLeft,
         )
     }
-    return DamageInputs(shooters, shots, missiles, defenses, rules)
+    return DamageInputs(shooters, shots, missiles, defenses, rules, pointDefense)
 }
 
 private fun captureRules(): DamageRules {
@@ -345,6 +356,8 @@ private fun buildMissileInfo(spec: MissileSpecAPI, live: MissileAPI?): MissileIn
         mineRange = if (live != null && live.isMine) live.mineExplosionRange else 0f,
         mirv = behavior?.let { parseMirv(it) },
         dem = behavior?.let { parseDem(it) },
+        hitpoints = live?.maxHitpoints ?: spec.hullSpec?.hitpoints ?: 0f,
+        radius = live?.collisionRadius ?: spec.hullSpec?.collisionRadius?.takeIf { it > 0f } ?: 15f,
     )
 }
 
@@ -435,18 +448,54 @@ private fun MissileAPI.toInFlight(): InFlightMissile? {
             if (rolled != null) info = MissileInfo(
                 info.maxSpeed, info.acceleration, info.maxTurnRate, info.turnAcceleration, info.launchSpeed,
                 info.maxFlightTime, info.flameoutTime, info.fadeTime, info.armingTime, info.noCollisionWhileFading,
-                info.reduceDamageWhileFading, info.isMine, info.mineRange, info.mirv, rolled,
+                info.reduceDamageWhileFading, info.isMine, info.mineRange, info.mirv, rolled, info.hitpoints, info.radius,
             )
         }
     }
+    // a DEM firing (or done) is already captured through its drone's payload beam (captureDemDroneBeam): vanilla's
+    // DEMScript spawns the drone at the trigger and keeps the missile alive while the drone fires, so counting the
+    // missile's payload too counted every firing DEM twice
+    if (demState == DemState.FIRE || demState == DemState.DONE) return null
     // a missile that can't turn (rockets, torpedoes) goes where it points, whatever its AI calls its target
     if (info.maxTurnRate <= 0f && info.dem == null) targetId = null
     return InFlightMissile(
         x = location.x, y = location.y, vx = velocity.x, vy = velocity.y, facing = facing,
         angularVelocity = angularVelocity, owner = owner, damage = damageAmount, emp = empAmount,
         kind = damageType.toKind(), softFlux = false, info = info, flightTime = flightTime, targetId = targetId,
-        demState = demState, demElapsed = demElapsed,
+        demState = demState, demElapsed = demElapsed, hitpoints = hitpoints, radius = collisionRadius,
     )
+}
+
+/**
+ * This ship's point defense (plan §14): its PD and PD_ONLY weapons (not STRIKE, not disabled, with ammo), aimed as
+ * vanilla's autofire aims them (see [PdFire]). PD_ALSO weapons shoot ships first and are left out.
+ */
+private fun ShipAPI.capturePointDefense(): PointDefense? {
+    val stats = mutableStats
+    val bestLeading = stats.dynamic.getValue(Stats.PD_BEST_TARGET_LEADING, 0f) >= 1f
+    val baseK = 2f - stats.autofireAimAccuracy.modifiedValue.coerceIn(0f, 1f)
+    val vsMissiles = stats.damageToMissiles.modifiedValue
+    val list = ArrayList<PdWeapon>()
+    for (w in allWeapons) {
+        if (w.isDecorative || w.slot.isDecorative || w.slot.isHidden || w.isPermanentlyDisabled || w.isDisabled) continue
+        if (!(w.hasAIHint(WeaponAPI.AIHints.PD) || w.hasAIHint(WeaponAPI.AIHints.PD_ONLY))) continue
+        if (w.hasAIHint(WeaponAPI.AIHints.STRIKE)) continue
+        if (w.usesAmmo() && w.ammo <= 0) continue
+        val derived = w.derivedStats ?: continue
+        val dps = derived.sustainedDps.takeIf { it > 0f } ?: derived.dps
+        val dpsVsMissiles = dps * damageFactor(w) * vsMissiles
+        if (dpsVsMissiles <= 0f) continue
+        val (mx, my) = toLocal(w.location)
+        var spread = w.spec.maxSpread * stats.maxRecoilMult.modifiedValue
+        if (w.slot.isHardpoint) spread /= 2f
+        list += PdWeapon(
+            mountX = mx, mountY = my, slotAngle = w.arcFacing, arc = w.arc, turnRate = w.turnRate, range = w.range,
+            speed = if (w.isBeam) PdWeapon.BEAM_SPEED else w.projectileSpeed.coerceAtLeast(100f), spread = spread,
+            dps = dpsVsMissiles,
+            inaccuracy = if (bestLeading) 1f else (baseK - w.spec.autofireAccBonus).coerceAtLeast(1f),
+        )
+    }
+    return if (list.isEmpty()) null else PointDefense(list, collisionRadius)
 }
 
 /** A DEM drone firing its payload beam: the remaining ticks, along its facing. */

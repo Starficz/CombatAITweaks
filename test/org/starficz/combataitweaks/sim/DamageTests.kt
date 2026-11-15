@@ -82,10 +82,11 @@ private fun fireAt(s: SimShooter, x: Float = 600f, steps: Int = 400, def: SimDef
 
 private fun missileInfo(
     maxSpeed: Float = 500f, accel: Float = 1000f, turn: Float = 120f, flight: Float = 10f, mirv: MirvInfo? = null,
+    hp: Float = 0f,
 ) = MissileInfo(
     maxSpeed = maxSpeed, acceleration = accel, maxTurnRate = turn, turnAcceleration = turn * 2f, launchSpeed = 50f,
     maxFlightTime = flight, flameoutTime = 1f, fadeTime = 0.5f, armingTime = 0f,
-    noCollisionWhileFading = false, reduceDamageWhileFading = true, mirv = mirv,
+    noCollisionWhileFading = false, reduceDamageWhileFading = true, mirv = mirv, hitpoints = hp,
 )
 
 private fun missile(
@@ -137,6 +138,7 @@ internal fun damage() {
     shields()
     fireControl()
     missiles()
+    pointDefense()
     endToEnd()
     autofire()
     ownFire()
@@ -803,4 +805,61 @@ private fun endToEnd() {
         "damage: venting instead puts the same fire on armor")
     check(result.hits.zipWithNext().all { (a, b) -> a.time <= b.time }, "damage: hits are in time order")
     check(abs(result.hits.first().fromX - 500f) < 400f, "damage: hits come from where the shooter is")
+}
+
+private fun pdGun(
+    speed: Float = 1000f, spread: Float = 0f, dps: Float = 200f, range: Float = 600f, arc: Float = 360f,
+    slotAngle: Float = 0f, turnRate: Float = 180f, k: Float = 2f,
+) = PdWeapon(0f, 0f, slotAngle, arc, turnRate, range, speed, spread, dps, k)
+
+/** Point defense against missiles (plan §14): vanilla's lead and its misses, the budget, the vent. */
+private fun pointDefense() {
+    val out = FloatArray(1)
+    // head on: a missile 500 out flying straight at the ship. Under-leading along the line of sight doesn't matter
+    val headOn = PdFire.hitChance(pdGun(), 2f, 0f, 0f, 0f, 0f, 0f, 0f, 50f, 500f, 0f, -400f, 0f, 0f, 0f, 15f, out)
+    check(headOn > 0.99f, "pd: a missile flying straight in is hit, even with vanilla's poor lead") { "$headOn" }
+    // crossing at 400 across the line of sight, 500 from the mount, the ship's centre 40 behind it (vanilla leads
+    // from the centre, less 0.75 x both radii): k = 2 leads by about half, k = 1 about the true intercept
+    val crossBad = PdFire.hitChance(pdGun(), 2f, 0f, 0f, -40f, 0f, 0f, 0f, 50f, 500f, 0f, 0f, 400f, 0f, 0f, 15f, out)
+    val crossGood = PdFire.hitChance(pdGun(), 1f, 0f, 0f, -40f, 0f, 0f, 0f, 50f, 500f, 0f, 0f, 400f, 0f, 0f, 15f, out)
+    check(crossBad < 0.01f && crossGood > 0.99f,
+        "pd: a crossing missile is missed with vanilla's default lead (k = 2), hit with best leading") { "$crossBad $crossGood" }
+    // a missile accelerating across isn't led for its acceleration, even with best leading
+    val accel = PdFire.hitChance(pdGun(speed = 600f), 1f, 0f, 0f, 0f, 0f, 0f, 0f, 50f, 500f, 0f, 0f, 200f, 0f, 1500f, 15f, out)
+    check(accel < 0.5f, "pd: acceleration isn't led") { "$accel" }
+    // spread spreads the chance over the cone: 10 degrees at 500 is a cone 87 wide against a 40 wide target
+    val spread = PdFire.hitChance(pdGun(spread = 10f), 1f, 0f, 0f, 0f, 0f, 0f, 0f, 50f, 500f, 0f, -400f, 0f, 0f, 0f, 15f, out)
+    near(spread, 40f / (2f * 500f * 1000f / 1400f * kotlin.math.tan(5f * DEG_TO_RAD)), 0.08f, "pd: spread lowers the chance by width")
+    // beams hit while the turret tracks; a slow turret against a fast crossing missile doesn't
+    val beam = PdFire.hitChance(pdGun(speed = PdWeapon.BEAM_SPEED), 2f, 0f, 0f, 0f, 0f, 0f, 0f, 50f, 300f, 0f, 0f, 400f, 0f, 0f, 15f, out)
+    val slowBeam = PdFire.hitChance(pdGun(speed = PdWeapon.BEAM_SPEED, turnRate = 20f), 2f, 0f, 0f, 0f, 0f, 0f, 0f, 50f, 300f, 0f, 0f, 400f, 0f, 0f, 15f, out)
+    check(beam == 1f && slowBeam < 0.3f, "pd: beams hit while the turret can track") { "$beam $slowBeam" }
+
+    // a missile run: a guided missile (100 hp) from 1500 at a still ship with a 200 DPS PD beam, 600 range
+    fun run(pd: PointDefense?, vararg ms: InFlightMissile): MissileSim =
+        MissileSim(defense(), 0, still(400), pd = pd).also { it.run(ms.toList()) }
+    val beamPd = PointDefense(listOf(pdGun(speed = PdWeapon.BEAM_SPEED)), 50f)
+    val light = missile(1500f, info = missileInfo(hp = 100f))
+    check(run(null, light).hits.size == 1, "pd: without PD the missile hits")
+    val shot = run(beamPd, light)
+    check(shot.hits.isEmpty() && shot.intercepted == 1, "pd: a light missile is shot down") { "${shot.hits.size} ${shot.intercepted}" }
+    val torpedo = run(beamPd, missile(1500f, info = missileInfo(hp = 2000f)))
+    check(torpedo.hits.size == 1, "pd: a heavy missile gets through")
+    val behind = run(PointDefense(listOf(pdGun(speed = PdWeapon.BEAM_SPEED, slotAngle = 180f, arc = 90f)), 50f), light)
+    check(behind.hits.size == 1, "pd: a weapon facing the other way doesn't help")
+    // one weapon, two missiles side by side: it engages one at a time, and the second gets through
+    val pair = run(beamPd, missile(1500f, y = -40f, info = missileInfo(hp = 150f)), missile(1500f, y = 40f, info = missileInfo(hp = 150f)))
+    check(pair.intercepted == 1 && pair.hits.size == 1, "pd: one weapon engages one missile at a time") { "${pair.intercepted} ${pair.hits.size}" }
+
+    // in a damage run: P's PD stops the missile, except in the vent-now run (venting, nothing fires)
+    val p = ship("P", owner = 0, maxSpeed = 0f, accel = 0f, decel = 0f, turnAccel = 0f, maxTurn = 0f)
+    val branch = World(listOf(p), SimParams(200)).branch("P", OwnPlan.Hold())
+    fun inputs(pd: Map<String, PointDefense>) = DamageInputs(emptyList(), emptyList(),
+        listOf(missile(1500f, info = missileInfo(hp = 100f), damage = 500f)), mapOf("P" to defense(maxFlux = 5000f)),
+        pointDefense = pd)
+    val withPd = DamageSim.run("P", 0, branch.timelines, inputs(mapOf("P" to beamPd)), withVent = true)!!
+    val noPd = DamageSim.run("P", 0, branch.timelines, inputs(emptyMap()), withVent = true)!!
+    check(withPd.hits.isEmpty() && noPd.hits.size == 1, "pd: the ship's PD stops the missile in its damage run")
+    check(withPd.ventNow!!.armorLost[199] > 0f && withPd.ventNow!!.armorLost[199] == noPd.ventNow!!.armorLost[199],
+        "pd: not while venting") { "${withPd.ventNow!!.armorLost[199]} ${noPd.ventNow!!.armorLost[199]}" }
 }

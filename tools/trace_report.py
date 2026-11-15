@@ -185,6 +185,56 @@ def position_report(tr, ships):
                       f">100 closer in {reacted_closer} ({100 * reacted_closer / reacted:.1f}%) {causes_closer}")
 
 
+def pd_report(tr, ships):
+    """Point defense (plan §14): the share of missiles aimed at CAT ships that were shot down, actual vs predicted.
+
+    Actual: missiles whose guidance target was a CAT ship. Hit = a hit record carries its id; shot down = no hit,
+    and its last sample had fewer hitpoints than its first (or it vanished well before its flight time ran out
+    with hitpoints lost). Predicted: over the hold predictions, intercepted / (intercepted + arrived); every batch
+    counts the missiles it sees, so it is an average share, not a missile count."""
+    print("\n== Point defense: share of missiles at CAT ships shot down ==")
+    cat = set(ships)
+    tracks = defaultdict(list)
+    for m in tr.by_kind["msl"]:
+        # DEMs left out (as in the prediction): their drones fire from range, the missile itself never hits
+        if m.get("tgt") in cat and "gorgon" not in (m.get("spec") or "") and "dem" not in (m.get("spec") or ""):
+            tracks[m["id"]].append(m)
+    hit_ids = set()
+    for sid in ships:
+        for h in tr.hits.get(sid, []):
+            if h.get("mid"):
+                hit_ids.add(h["mid"])
+    fate = defaultdict(lambda: defaultdict(int))
+    for mid, tr_ in tracks.items():
+        spec = tr_[0].get("spec", "?")
+        first_hp = tr_[0].get("hp")
+        last_hp = tr_[-1].get("hp")
+        if mid in hit_ids:
+            fate[spec]["hit"] += 1
+        elif first_hp is not None and last_hp is not None and last_hp < first_hp - 0.5:
+            fate[spec]["down"] += 1
+        else:
+            fate[spec]["other"] += 1
+    down = sum(f["down"] for f in fate.values())
+    hit = sum(f["hit"] for f in fate.values())
+    if not tracks:
+        print("  no missiles aimed at CAT ships")
+    else:
+        share = down / (down + hit) if down + hit else 0.0
+        print(f"  actual: {len(tracks)} missiles, {down} shot down, {hit} hit, "
+              f"{sum(f['other'] for f in fate.values())} other (missed, expired, decoyed); shot down share {share:.2f}")
+        for spec, f in sorted(fate.items(), key=lambda kv: -sum(kv[1].values())):
+            print(f"    {spec:28s} down {f['down']:3d}  hit {f['hit']:3d}  other {f['other']:3d}")
+    k = n = 0
+    for p in tr.by_kind["pred"]:
+        if p.get("id") in cat and "pdk" in p:
+            k += p["pdk"]; n += p["pdn"]
+    if k + n:
+        print(f"  predicted (hold branch, summed over batches): intercepted {k}, arrived {n}; share {k / (k + n):.2f}")
+    else:
+        print("  predicted: no missiles in the hold predictions")
+
+
 def missile_report(tr, ships):
     print("\n== Missiles: hits on CAT ships from missiles the predictor never saw ==")
     inputs = tr.by_kind["in"]
@@ -328,6 +378,7 @@ def main():
     damage_report(tr, ships, a.window, a.worst)
     position_report(tr, ships)
     missile_report(tr, ships)
+    pd_report(tr, ships)
     vent_report(tr, ships)
     move_report(tr, ships, a.changes)
     shield_report(tr, ships)
