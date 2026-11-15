@@ -98,7 +98,7 @@ class DefenseController(private val ship: ShipAPI) {
         /** Custom-data key: whether CAT wants the defensive system used now (the trace, the checks). */
         const val USING = "CAT_DEFENSE_USING"
         /** Margin for mispredicted hit times (the trouble arriving earlier than predicted). */
-        const val BUFFER = 0.35f
+        val BUFFER = org.starficz.combataitweaks.sim.Tuning.defenseBuffer
         /** Decision tick (up to 0.1 s) and the command landing next frame. */
         const val LATENCY = 0.1f
         /** A toggle CAT turned on stays on this long (its charge-up and charge-down make flapping costly). */

@@ -32,6 +32,16 @@ public final class Groups {
                 case "movecases":
                     all.addAll(MoveCases.steps());
                     break;
+                // tuning: rounds of seeded fleet battles, each with CAT and with vanilla AI; ends the run. With
+                // cat.tune.slices N, "tunebattleK" plays every Nth seed from the K-th (one per --shards game)
+                case "tunebattle":
+                case "tunebattle2":
+                case "tunebattle3":
+                case "tunebattle4":
+                case "tunebattle5":
+                case "tunebattle6":
+                    all.addAll(TuneBattle.steps());
+                    break;
                 default:
                     throw new IllegalArgumentException("Unknown group " + one);
             }

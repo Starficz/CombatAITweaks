@@ -10,7 +10,7 @@ import kotlin.math.ceil
 object Constants {
     const val TIME_STEP = DT
     /** Horizon H (plan §7): every branch is simulated this far ahead. */
-    const val PREDICTION_DURATION = 10f
+    val PREDICTION_DURATION = org.starficz.combataitweaks.sim.Tuning.horizon
     val TOTAL_FUTURE_STATES = ceil(PREDICTION_DURATION / TIME_STEP).toInt()
 }
 

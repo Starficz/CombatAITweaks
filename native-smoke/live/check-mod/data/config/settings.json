@@ -8,5 +8,6 @@
 		"livecheck_catWorstCaseDriver":"livecheck.WorstCaseDriver",
 		"livecheck_catVentCasesDriver":"livecheck.VentCasesDriver",
 		"livecheck_catMoveCasesDriver":"livecheck.MoveCasesDriver",
+		"livecheck_catTuneBattleDriver":"livecheck.TuneBattleDriver",
 	},
 }

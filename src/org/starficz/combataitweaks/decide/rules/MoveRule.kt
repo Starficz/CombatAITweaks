@@ -111,8 +111,8 @@ class MoveChoice(
  */
 object MoveRule {
     /** A system variant must cost at most this fraction of the plain option, and save [SYSTEM_MIN_SAVING]. */
-    const val SYSTEM_GAIN = 0.8f
-    const val SYSTEM_MIN_SAVING = 50f
+    val SYSTEM_GAIN = org.starficz.combataitweaks.sim.Tuning.systemGain
+    val SYSTEM_MIN_SAVING = org.starficz.combataitweaks.sim.Tuning.systemMinSaving
     /** The system is used to advance only from this far outside the advance range. */
     const val ADVANCE_SYSTEM_GAP = 300f
     /** The back-off flown by vanilla's flags; the 4b directions are named `BACK_OFF@<degrees>`. */

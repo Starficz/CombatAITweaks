@@ -37,7 +37,16 @@ stage_mod() {
 # aibattle size per side: small by default (laptop); CAT_BATTLE_FLEETS=2 CAT_BATTLE_FP=250 for a big stress battle
 # CAT_TRACE=false turns off the battle trace (saves/common/cat_trace/ in the work folder; tools/trace_report.py)
 # CAT_PD=false leaves point defense out of the predictions (plan §14), for A/B runs
+# tunebattle: CAT_TUNE_SEEDS (comma separated), CAT_TUNE_MODES (cat,vanilla), CAT_TUNE_FP (per side),
+# CAT_TUNE_SECONDS (cap per round), CAT_TUNE_SLICES (games sharing the seeds: groups tunebattle,tunebattle2,...
+# with --shards); CAT_TUNE_SET: extra -D settings for CAT's tunables, space separated
+# (e.g. CAT_TUNE_SET="-Dcat.tune.horizon=8 -Dcat.tune.reactionTime=0.5")
 java_args() {
     printf '%s\n' "-Dcat.battle.fleets=${CAT_BATTLE_FLEETS:-1}" "-Dcat.battle.fp=${CAT_BATTLE_FP:-60}" \
-        "-Dcat.trace=${CAT_TRACE:-true}" "-Dcat.pd=${CAT_PD:-true}"
+        "-Dcat.trace=${CAT_TRACE:-true}" "-Dcat.pd=${CAT_PD:-true}" \
+        "-Dcat.tune.seeds=${CAT_TUNE_SEEDS:-1,2,3}" "-Dcat.tune.modes=${CAT_TUNE_MODES:-cat,vanilla}" \
+        "-Dcat.tune.fp=${CAT_TUNE_FP:-60}" "-Dcat.tune.seconds=${CAT_TUNE_SECONDS:-240}" \
+        "-Dcat.tune.slices=${CAT_TUNE_SLICES:-1}"
+    local s
+    for s in ${CAT_TUNE_SET:-}; do printf '%s\n' "$s"; done
 }

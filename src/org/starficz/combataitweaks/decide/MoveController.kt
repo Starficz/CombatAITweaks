@@ -464,7 +464,7 @@ class MoveController(
          * How long the ship keeps doing an option before it can turn around: the decision's 0.5 s hysteresis plus
          * about 0.2 s of decision tick and prediction age. The "then escape" options switch to the escape here.
          */
-        const val REACTION_TIME = 0.7f
+        val REACTION_TIME = org.starficz.combataitweaks.sim.Tuning.reactionTime
 
         /** Turns the ship's system on ([use]) or keeps it off: toggles flip to match, others fire or are blocked. */
         fun useSystem(ship: ShipAPI, use: Boolean) {

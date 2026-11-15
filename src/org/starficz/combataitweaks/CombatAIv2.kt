@@ -14,20 +14,22 @@ import org.starficz.combataitweaks.decide.VentController
 import org.starficz.combataitweaks.predictor.PredictorManager
 import org.starficz.combataitweaks.runtime.CombatScan
 import org.starficz.combataitweaks.runtime.VanillaTarget
+import org.starficz.combataitweaks.sim.Tuning
 
+// defaults from Tuning (-Dcat.tune.<name> at launch overrides them, for the tuning battles)
 data class CombatAIConfig(
     val bufferTime: Float = 0.1f,
-    val minVentLevel: Float = 0.2f,
+    val minVentLevel: Float = Tuning.minVentLevel,
     val safeShieldArc: Float = 60f,
-    val maxArmorDamageLevelToVent: Float = 0.1f,
-    val maxHullDamageLevelToVent: Float = 0.05f,
-    val stopVentingBelowHullLevel: Float = 0.5f,
-    val maxFluxLevelRaiseToHarass: Float = 0.3f,
-    val reengageIfFluxDropsBelowLevel: Float = 0.4f,
-    val forceAdvanceIfFluxBelowLevel: Float = 0.7f,
+    val maxArmorDamageLevelToVent: Float = Tuning.maxArmorDamageLevelToVent,
+    val maxHullDamageLevelToVent: Float = Tuning.maxHullDamageLevelToVent,
+    val stopVentingBelowHullLevel: Float = Tuning.stopVentingBelowHullLevel,
+    val maxFluxLevelRaiseToHarass: Float = Tuning.maxFluxLevelRaiseToHarass,
+    val reengageIfFluxDropsBelowLevel: Float = Tuning.reengageIfFluxDropsBelowLevel,
+    val forceAdvanceIfFluxBelowLevel: Float = Tuning.forceAdvanceIfFluxBelowLevel,
     val disengageIfFluxAboveLevel: Float = 1f,
-    val backoffIfFluxAboveLevel: Float = 0.85f,
-    val backoffIfHardfluxAboveLevel: Float = 0.75f
+    val backoffIfFluxAboveLevel: Float = Tuning.backoffIfFluxAboveLevel,
+    val backoffIfHardfluxAboveLevel: Float = Tuning.backoffIfHardfluxAboveLevel
 ) {
     fun toJsonString(): String {
         val json = JSONObject()

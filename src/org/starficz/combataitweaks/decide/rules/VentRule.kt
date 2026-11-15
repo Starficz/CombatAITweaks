@@ -63,7 +63,7 @@ object VentRule {
      */
     const val SAFE_MARGIN = 0.8f
     /** Cost weights (plan §8.2): hull counts triple. */
-    const val HULL_WEIGHT = 3f
+    val HULL_WEIGHT = org.starficz.combataitweaks.sim.Tuning.hullWeight
     /** Hull loss treated as none: a stray fragment shouldn't forbid a vent. */
     const val HULL_EPSILON = 1f
 

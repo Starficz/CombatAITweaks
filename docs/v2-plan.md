@@ -709,6 +709,26 @@ read the damage-taken mults and upkeep as they were, so a damper on at the snaps
   slot): idle no system captured; on, the system carries the live x0.33, the ship keeps x1.00, 3.25 s left (0.25
   charge-down), no shield, vent or firing. `movecases`, `aibattle`, `worstcase` pass.
 
+## 11b2. Tuning (milestone 6)
+
+Started 2026-11-15, paused the same day for more hardware: `docs/tuning-handoff.md` has the state, how to run it and
+the plan. A setting is judged by CAT's effect on the same fights, against vanilla.
+- **Harness: the `tunebattle` group** (`TuneBattle`, `TuneBattleDriver`). One battle holds rounds. Each round spawns
+  two seeded fleets (`FleetFactoryV3`, `params.random` from the seed; factions picked by the seed), the player's with
+  CAT or without, fights until one side has no ships or the cap (240 s), writes one `TUNE` line per round (per side:
+  ships and FP fielded and lost, FP-weighted hull and armor share lost, a destroyed ship counting fully), then clears
+  the field. No boot, no post-battle dialog between rounds. Settings: `CAT_TUNE_SEEDS`, `CAT_TUNE_MODES`
+  (`cat,vanilla`; vanilla rounds don't depend on CAT's settings, so they are run once per seed), `CAT_TUNE_FP`,
+  `CAT_TUNE_SECONDS`, `CAT_TUNE_SLICES` (games sharing the seeds with `--shards`: groups `tunebattle`,
+  `tunebattle2` ...).
+- **Tunables:** `sim/Tuning`, each `-Dcat.tune.<name>` at launch (`CAT_TUNE_SET`), default the shipped value: `horizon`
+  (H), `reactionTime` (τ), `hullWeight`, `systemGain`, `systemMinSaving`, `defenseBuffer`, and the config defaults
+  (vent limits, flux back-off and advance levels). The run logs them (`TUNE settings`).
+- **Report:** `tools/tune_report.py <runs>` pairs each seed's rounds: CAT - vanilla own loss (lower is better: survival
+  first), enemy loss, exchange (enemy loss - own loss).
+- Battles aren't deterministic even with the same fleets (AI timing): repeats of one setting measure the noise
+  before a difference counts.
+
 ## 11c. Progress
 
 **Milestone 1: done, 2026-11-13.**
