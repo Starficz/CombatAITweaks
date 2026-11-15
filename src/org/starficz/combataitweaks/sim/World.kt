@@ -1,7 +1,9 @@
 package org.starficz.combataitweaks.sim
 
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * The predicted battlefield for one batch.
@@ -35,6 +37,11 @@ class World(
         const val TARGET_MARGIN = 400f
         /** Re-picks checked (on base paths) every this many seconds over the first half of the commit window. */
         const val REPICK_EVERY = 2f
+        /**
+         * A standoff pushed farther than this beyond its target's own standoff range (another hostile behind the
+         * ship) keeps the target's range instead: no point on the line is out of reach, so the sim shows the cost.
+         */
+        const val MAX_STANDOFF_PUSH = 1000f
     }
 
     fun targetingRadius(protectedShip: SimShip, other: SimShip): Float =
@@ -197,9 +204,10 @@ class World(
         val after = (plan as? OwnPlan.Then)?.then
         val switchAt = (plan as? OwnPlan.Then)?.switchAt ?: Float.MAX_VALUE
 
-        // the ship the plan moves relative to (approached or backed away from), and where it is each step
+        // the ship the plan moves relative to (approached, held off or backed away from), and where it is each step
         fun relativeTo(part: OwnPlan?) = when (part) {
             is OwnPlan.Approach -> part.targetId
+            is OwnPlan.Standoff -> part.targetId
             is OwnPlan.BackAway -> part.fromId
             else -> null
         }
@@ -207,14 +215,20 @@ class World(
         val other = otherId?.let { byId[it] }?.takeIf { !it.isModule && it.id != p.id }
         val otherPursuer = other?.let { o -> pursuers.indexOfFirst { it.ship.id == o.id } } ?: -1
         val otherState = FloatArray(4)
-        val approachRange = if (first is OwnPlan.Approach && other != null) {
+        val closes = first is OwnPlan.Approach || first is OwnPlan.Standoff
+        val ownRange = if (closes && other != null) {
             Pursuit.approachDistance(p, ownTargetRadius[p.id]?.get(other.id) ?: other.collisionRadius)
         } else 0f
-        // advancing reuses the pursuit movement (arrive at the hold point, face with the best guns), without the
-        // enemy-style system use: the protected ship's own system comes from the plan's phases
-        val mover = if (first is OwnPlan.Approach && other != null) {
-            Pursuit.Pursuer(p, approachRange, useSystem = false, limitsOverride = { t -> phased.at(t * p.timeMult) })
+        val approachRange = if (first is OwnPlan.Approach) ownRange else 0f
+        // advancing and the standoff reuse the pursuit movement (arrive at the hold point, face with the best guns),
+        // without the enemy-style system use: the protected ship's own system comes from the plan's phases
+        val mover = if (closes && other != null) {
+            Pursuit.Pursuer(p, ownRange, useSystem = false, limitsOverride = { t -> phased.at(t * p.timeMult) })
         } else null
+        val standoff = if (first is OwnPlan.Standoff && other != null) {
+            StandoffRange(p, other, ownRange, pursuers, committedIds)
+        } else null
+        var standoffRange = 0f
         val body = mover?.body ?: Body(p)
 
         for (i in 0 until steps) {
@@ -234,8 +248,12 @@ class World(
                 is OwnPlan.BackAway ->
                     if (other != null) thrust(body, limits, body.x - otherState[0], body.y - otherState[1], dt)
                     else Motion.step(body, limits, 0f, 0f, true, dt)
-                is OwnPlan.Approach ->
+                is OwnPlan.Approach, is OwnPlan.Standoff ->
                     if (mover != null) {
+                        if (standoff != null) {
+                            mover.hold = standoff.at(i, body, otherState[0], otherState[1])
+                            if (i == 0) standoffRange = mover.hold
+                        }
                         mover.step(t, otherState[0], otherState[1], otherState[2], otherState[3])
                         faced = true
                     } else Motion.step(body, limits, 0f, 0f, true, dt)
@@ -265,7 +283,71 @@ class World(
         }
         val clearRange = committed.keys.filter { !it.isFighter }
             .maxOfOrNull { Pursuit.clearDistance(it, p, targetingRadius(p, it), params) } ?: 0f
-        return BranchResult(timelines, committed.mapKeys { it.key.id }, approachRange, clearRange)
+        return BranchResult(timelines, committed.mapKeys { it.key.id }, approachRange, clearRange, standoffRange)
+    }
+
+    /**
+     * The standoff's range to its target each step (plan §13.4). On the line from the target through the ship: the
+     * target's standoff distance ([Pursuit.standoffDistance]; nothing for a friendly or harmless target) or the
+     * ship's own range [ownRange] if farther, pushed out until no other hostile non-fighter's gun reach covers the
+     * point. Committed enemies are where they are in this branch, the rest on their base paths.
+     */
+    private inner class StandoffRange(
+        private val p: SimShip, private val target: SimShip, private val ownRange: Float,
+        pursuers: List<Pursuit.Pursuer>, committedIds: Set<String>,
+    ) {
+        private val targetRange = if (target.owner != p.owner && target.gunReach > 0f) {
+            Pursuit.standoffDistance(target, targetingRadius(p, target))
+        } else 0f
+        private val chasers = pursuers.filter { !it.ship.isFighter && it.ship.id != target.id && it.ship.gunReach > 0f }
+        private val chaserRanges = FloatArray(chasers.size) {
+            Pursuit.standoffDistance(chasers[it].ship, targetingRadius(p, chasers[it].ship))
+        }
+        private val others = roots.filter {
+            it.owner != p.owner && !it.isFighter && it.id != target.id && it.id !in committedIds && it.gunReach > 0f
+        }
+        private val otherRanges = FloatArray(others.size) { Pursuit.standoffDistance(others[it], targetingRadius(p, others[it])) }
+        private val otherTimelines = others.map { base[it.id]!! }
+
+        /** The range at step [i], with the ship at [body] and its target at (tx, ty). */
+        fun at(i: Int, body: Body, tx: Float, ty: Float): Float {
+            val want = max(ownRange, targetRange)
+            var ux = body.x - tx; var uy = body.y - ty
+            val len = length(ux, uy)
+            if (len > 1f) { ux /= len; uy /= len } else { ux = 1f; uy = 0f }
+            var d = want
+            // each hostile rules out an interval of the line; a few passes settle overlapping ones
+            for (pass in 0 until 3) {
+                var moved = false
+                for (k in chasers.indices) {
+                    val b = chasers[k].body
+                    val pushed = pushOut(d, ux, uy, b.x - tx, b.y - ty, chaserRanges[k])
+                    if (pushed > d) { d = pushed; moved = true }
+                }
+                for (k in others.indices) {
+                    val tl = otherTimelines[k]
+                    val hx = if (i == 0) others[k].x else tl.x[i - 1]
+                    val hy = if (i == 0) others[k].y else tl.y[i - 1]
+                    val pushed = pushOut(d, ux, uy, hx - tx, hy - ty, otherRanges[k])
+                    if (pushed > d) { d = pushed; moved = true }
+                }
+                if (!moved) break
+            }
+            return if (d > want + MAX_STANDOFF_PUSH) want else d
+        }
+
+        /**
+         * The point at [d] along (ux, uy) from the target, moved outward past a hostile at (hx, hy) relative to the
+         * target whose reach is [range]: the far root of |u d - h| = range when d lies inside, else d.
+         */
+        private fun pushOut(d: Float, ux: Float, uy: Float, hx: Float, hy: Float, range: Float): Float {
+            val b = ux * hx + uy * hy
+            val c = hx * hx + hy * hy - range * range
+            val disc = b * b - c
+            if (disc <= 0f) return d
+            val root = sqrt(disc)
+            return if (d > b - root && d < b + root) b + root else d
+        }
     }
 
     /** Thrusts as hard as the engines allow toward world direction (dx, dy); brakes if it has no length. */

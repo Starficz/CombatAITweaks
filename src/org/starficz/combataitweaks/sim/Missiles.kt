@@ -23,14 +23,20 @@ class MissileSim(
     private val target: SimDefense,
     private val targetOwner: Int,
     private val timeline: Timeline,
+    /** Where its hits come from; null: new ones. */
+    private val pool: Scratch? = null,
 ) {
     private val steps = timeline.steps
 
     val hits = ArrayList<Hit>()
 
     /** Per step: bearing from the target to the nearest powered missile within 600 units closing on it, or NaN. */
-    val missileBearing = FloatArray(steps) { Float.NaN }
-    private val missileDistance = FloatArray(steps) { Float.MAX_VALUE }
+    /** Only for omni shields ([FireControl.omniFacing] combines them); empty otherwise. */
+    private val tracksMissiles = target.shield == ShieldKind.OMNI
+    val missileBearing = if (!tracksMissiles) FloatArray(0)
+        else pool?.floats(steps, Float.NaN) ?: FloatArray(steps) { Float.NaN }
+    private val missileDistance = if (!tracksMissiles) FloatArray(0)
+        else pool?.floats(steps, Float.MAX_VALUE) ?: FloatArray(steps) { Float.MAX_VALUE }
 
     private class Flight(val m: InFlightMissile) {
         var x = m.x; var y = m.y
@@ -88,7 +94,7 @@ class MissileSim(
                 }
             }
             if (done) return
-            if (powered && dist < 600f && dist < missileDistance[i]) {
+            if (tracksMissiles && powered && dist < 600f && dist < missileDistance[i]) {
                 missileDistance[i] = dist
                 missileBearing[i] = angleOf(f.x - tx, f.y - ty)
             }
@@ -219,7 +225,7 @@ class MissileSim(
     private fun demPayload(f: Flight, p: DemInfo, time: Float) {
         val m = f.m
         if (!p.payloadIsBeam) {
-            if (f.demElapsed <= 0f) hits += Hit(
+            if (f.demElapsed <= 0f) hits += pool.hit(
                 time = time, damage = p.payloadDamage, hitStrength = p.payloadDamage, emp = p.payloadEmp,
                 kind = p.payloadKind, delivery = Delivery.PROJECTILE, softFlux = false,
                 conservative = m.conservative, fromX = f.x, fromY = f.y, sourceId = m.sourceId,
@@ -230,7 +236,7 @@ class MissileSim(
         var t = 0f
         while (t < p.firingTime - 1e-4f) {
             val tick = min(FireControl.BEAM_TICK, p.firingTime - t)
-            if (t >= f.demElapsed) hits += Hit(
+            if (t >= f.demElapsed) hits += pool.hit(
                 time = time + (t - f.demElapsed), damage = p.payloadDamage * tick, hitStrength = p.payloadDamage,
                 emp = p.payloadEmp * tick, kind = p.payloadKind, delivery = Delivery.BEAM,
                 softFlux = p.payloadSoftFlux, conservative = m.conservative, fromX = f.x, fromY = f.y,
@@ -261,7 +267,7 @@ class MissileSim(
 
     private fun hit(f: Flight, time: Float, scale: Float, delivery: Delivery) {
         val m = f.m
-        hits += Hit(
+        hits += pool.hit(
             time = time, damage = m.damage * scale, hitStrength = m.damage * scale, emp = m.emp * scale,
             kind = m.kind, delivery = delivery, softFlux = m.softFlux, conservative = m.conservative,
             fromX = f.x, fromY = f.y, sourceId = m.sourceId,
@@ -363,7 +369,7 @@ class MissileSim(
     }
 
     private fun record(shot: InFlightShot, time: Float, x: Float, y: Float, sourceId: String) {
-        hits += Hit(
+        hits += pool.hit(
             time = time, damage = shot.damage, hitStrength = shot.hitStrength, emp = shot.emp, kind = shot.kind,
             delivery = shot.delivery, softFlux = shot.softFlux, conservative = false,
             fromX = x, fromY = y, sourceId = sourceId,

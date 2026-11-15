@@ -29,6 +29,7 @@ import org.starficz.combataitweaks.ui.ConfigDialog.Companion.ENABLE_CAT_AI_TAG
 import java.awt.Color
 import java.util.*
 import java.util.concurrent.Executors
+import org.starficz.combataitweaks.sim.Scratch
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.cos
@@ -60,6 +61,8 @@ class PredictorManager private constructor() {
         private const val MIN_BATCH_INTERVAL = 0.1f
         /** Option names (plan §7); the vent decision reads HOLD and BACK_OFF. */
         const val HOLD = "HOLD"
+        /** The standoff `HOLD` (plan §13.4): what the `HOLD` state is judged by and flies. */
+        const val STANDOFF = "STANDOFF"
         const val ADVANCE = "ADVANCE"
         const val BACK_OFF = "BACK_OFF"
         const val SYSTEM_SUFFIX = "+SYSTEM"
@@ -141,6 +144,8 @@ class PredictorManager private constructor() {
             if (freshestRequests.isNotEmpty()) {
                 val aiShipIds = freshestRequests.keys
                 val snapshotTime = engine.getTotalElapsedTime(false)
+                // the trace reads every hit and the detail arrays; otherwise runs are lean (plan: garbage)
+                val lean = !org.starficz.combataitweaks.runtime.TraceRecorder.enabled()
                 val motion = engine.captureMotion(aiShipIds)
                 val damageInputs = engine.captureDamage(aiShipIds)
                 latestDamageInputs = damageInputs
@@ -165,7 +170,7 @@ class PredictorManager private constructor() {
                         val jobs = wanted.map { (shipId, options) ->
                             async {
                                 shipId to predictOptions(world, shipId, options, damageInputs, snapshotTime,
-                                    sideFire[world.byId[shipId]!!.owner] ?: emptyMap())
+                                    sideFire[world.byId[shipId]!!.owner] ?: emptyMap(), lean)
                             }
                         }
 
@@ -196,8 +201,11 @@ class PredictorManager private constructor() {
      */
     private suspend fun predictOptions(
         world: World, shipId: String, options: List<OptionRequest>, inputs: DamageInputs, snapshotTime: Float,
-        sideHits: Map<String, List<org.starficz.combataitweaks.sim.Hit>>,
+        sideHits: Map<String, List<org.starficz.combataitweaks.sim.Hit>>, lean: Boolean,
     ): Map<String, RequestResult> = coroutineScope {
+        // each block below runs start to end on one worker thread (nothing suspends inside), so the thread's pool
+        // is safe to reset at its start
+        fun pool() = if (lean) Scratch.local().also { it.reset() } else null
         val ship = world.byId[shipId]!!
         val owner = ship.owner
         val own = OwnFire(ship.maneuverTargetId, resolveTargets = true, sideHits = sideHits)
@@ -206,19 +214,20 @@ class PredictorManager private constructor() {
         val shared = if (quiet) {
             val hold = branches.firstOrNull { it.first.name == HOLD } ?: branches.first()
             DamageSim.run(shipId, owner, hold.second.timelines, inputs, withVent = branches.any { it.first.withVent },
-                own)
+                own, pool = pool())
         } else null
         branches.map { (req, branch) ->
             async {
                 var final = branch
                 var damage = if (quiet) shared
-                             else DamageSim.run(shipId, owner, branch.timelines, inputs, req.withVent, own)
+                             else DamageSim.run(shipId, owner, branch.timelines, inputs, req.withVent, own, pool = pool())
                 val coupling = if (quiet || damage == null) Coupling.NONE
                                else Reactions.find(world, shipId, branch.committed.keys, damage)
                 if (!coupling.isEmpty()) {
                     final = if (coupling.reactions.isEmpty()) branch
                             else world.branch(shipId, req.plan, coupling.reactions)
-                    val again = DamageSim.run(shipId, owner, final.timelines, inputs, false, own, coupling)
+                    // the first run's hits are done with (only its outcomes are read): the pool starts over
+                    val again = DamageSim.run(shipId, owner, final.timelines, inputs, false, own, coupling, pool())
                     if (again != null) damage = again.withVentNow(damage!!.ventNow)
                 }
                 RequestResult(
@@ -230,6 +239,7 @@ class PredictorManager private constructor() {
                     pursuitTimelines = final.committed.keys.associateWith { final.timelines[it]!! },
                     approachRange = final.approachRange,
                     clearRange = final.clearRange,
+                    standoffRange = final.standoffRange,
                     reactions = coupling.reactions,
                 )
             }
@@ -299,7 +309,7 @@ class PredictorManager private constructor() {
                 val dangerRatio = when {
                     normal == null -> 0f
                     ship.shield != null && ship.shield.type != ShieldAPI.ShieldType.NONE ->
-                        normal.potentialFlux[normal.steps - 1] / ship.maxFlux.coerceAtLeast(1f)
+                        normal.potentialFluxEnd / ship.maxFlux.coerceAtLeast(1f)
                     else -> normal.hullLost[normal.steps - 1] / ship.maxHitpoints.coerceAtLeast(1f)
                 }
                 val hue = 0.55f * (1f - dangerRatio.coerceIn(0f, 1f))
@@ -373,6 +383,8 @@ class CATCombatPlugin : BaseEveryFrameCombatPlugin() {
 
     override fun advance(amount: Float, events: List<InputEventAPI>?) {
         val engine = Global.getCombatEngine() ?: return
+        // reasons with numbers only when something reads them (the trace)
+        org.starficz.combataitweaks.decide.Explain.enabled = org.starficz.combataitweaks.runtime.TraceRecorder.enabled()
 
         for (ship in engine.ships) {
             if (ship.isFighter || ship.isHulk || !ship.isAlive) continue

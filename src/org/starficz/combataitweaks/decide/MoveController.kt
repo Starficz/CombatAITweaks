@@ -11,8 +11,11 @@ import org.starficz.combataitweaks.predictor.OptionRequest
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.ADVANCE
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.BACK_OFF
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.HOLD
+import org.starficz.combataitweaks.predictor.PredictorManager.Companion.STANDOFF
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.SYSTEM_SUFFIX
 import org.starficz.combataitweaks.predictor.RequestResult
+import org.starficz.combataitweaks.runtime.CombatScan
+import org.starficz.combataitweaks.runtime.VanillaManeuver
 import org.starficz.combataitweaks.runtime.VanillaTarget
 import org.starficz.combataitweaks.sim.OwnPlan
 import org.starficz.combataitweaks.sim.Pursuit
@@ -49,13 +52,20 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
     private var lastRepick = -99f
     private var lastVanillaBackOffFree = false
     private var holdTarget: ShipAPI? = null
+    /** The last strafe maneuver CAT handed vanilla: when, on whom, at what surface range. */
+    private var issuedAt = -99f
+    private var issuedTarget: ShipAPI? = null
+    private var issuedRange = 0f
+    private var issuedManeuver: Any? = null
 
     /**
      * The options to predict next. [latest] is the ship's newest results: their committed enemies set the escape
      * direction and the 4b back-off directions. The 4b directions are only asked for while backing off is in play
      * (the ship is backing off, or holding wasn't ok last time), to keep the branch count down.
-     * - `HOLD` / `ADVANCE`: keep it up the whole horizon (their flux limits; `HOLD` is also the vent's hold option);
-     *   `HOLD~` / `ADVANCE~`: do it for [REACTION_TIME], then escape (their safety).
+     * - `HOLD`: keep still (the vent's hold option); `STANDOFF`: the `HOLD` state, just outside every enemy's gun
+     *   reach (plan §13.4, its own safety and flux).
+     * - `ADVANCE`: close to range and stay (its flux limit); `ADVANCE~`: do it for [REACTION_TIME], then escape (its
+     *   safety).
      */
     fun options(target: ShipAPI?, latest: Map<String, RequestResult>): List<OptionRequest> {
         val plain = profile?.let { SystemProfiles.plainPhases(ship, it) } ?: emptyList()
@@ -75,7 +85,7 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
             val advanceMatters = !(state == MoveState.DISENGAGE && ship.fluxLevel > config.reengageIfFluxDropsBelowLevel)
             val backingOffMatters = (state == MoveState.BACK_OFF || state == MoveState.DISENGAGE || !lastHoldOk) &&
                 !lastVanillaBackOffFree
-            list += OptionRequest(HOLD + ESCAPE, thenEscape(OwnPlan.Hold(plain)), withVent = false)
+            list += OptionRequest(STANDOFF, OwnPlan.Standoff(target.id, plain), withVent = false)
             list += OptionRequest(BACK_OFF, OwnPlan.BackAway(target.id, plain), withVent = true)
             if (advanceMatters) {
                 list += OptionRequest(ADVANCE + ESCAPE, thenEscape(OwnPlan.Approach(target.id, plain)), withVent = false)
@@ -111,14 +121,14 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
      */
     private fun allyDirection(): Pair<Float, Float>? {
         val engine = Global.getCombatEngine() ?: return null
+        val scan = CombatScan.of(engine)
         var cx = 0f; var cy = 0f; var total = 0f
-        for (ally in engine.ships) {
-            if (ally === ship || ally.owner != ship.owner || !ally.isAlive || ally.isHulk || ally.isFighter) continue
+        for (k in scan.ships.indices) {
+            val ally = scan.ships[k]
+            if (ally === ship || ally.owner != ship.owner) continue
             if (ally.isRetreating || ally.isStationModule) continue
             if (MathUtils.getDistanceSquared(ally.location, ship.location) > ALLY_RANGE * ALLY_RANGE) continue
-            val dps = ally.allWeapons.sumOf { w ->
-                if (w.hasAIHint(WeaponAPI.AIHints.PD_ONLY)) 0.0 else w.derivedStats.dps.toDouble()
-            }.toFloat()
+            val dps = scan.dps(ally)
             if (dps <= 0f) continue
             cx += ally.location.x * dps; cy += ally.location.y * dps; total += dps
         }
@@ -137,12 +147,12 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
     private fun threatCentre(committed: Set<String>): Pair<Float, Float>? {
         if (committed.isEmpty()) return null
         val engine = Global.getCombatEngine() ?: return null
+        val scan = CombatScan.of(engine)
         var cx = 0f; var cy = 0f; var total = 0f
-        for (enemy in engine.ships) {
-            if (enemy.id !in committed || !enemy.isAlive || enemy.isHulk || enemy.isFighter) continue
-            val dps = enemy.allWeapons.sumOf { w ->
-                if (w.hasAIHint(WeaponAPI.AIHints.PD_ONLY)) 0.0 else w.derivedStats.dps.toDouble()
-            }.toFloat().coerceAtLeast(1f)
+        for (k in scan.ships.indices) {
+            val enemy = scan.ships[k]
+            if (enemy.id !in committed) continue
+            val dps = scan.dps(enemy).coerceAtLeast(1f)
             cx += enemy.location.x * dps; cy += enemy.location.y * dps; total += dps
         }
         return if (total > 0f) (cx / total) to (cy / total) else null
@@ -177,11 +187,12 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
                 r.name.startsWith(BACK_OFF) -> MoveKind.BACK_OFF
                 else -> MoveKind.HOLD
             }
-            r.outlook.moveOption(r.name, kind, r.name.endsWith(SYSTEM_SUFFIX), now, ship.maxFlux, r.name.contains(ESCAPE))
+            r.outlook.moveOption(r.name, kind, r.name.endsWith(SYSTEM_SUFFIX), now, ship.maxFlux, r.name.contains(ESCAPE),
+                standoff = r.name == STANDOFF)
         }
         val hullLimit = if (ship.hullLevel < config.stopVentingBelowHullLevel) VentRule.HULL_EPSILON
             else ship.maxHitpoints * config.maxHullDamageLevelToVent
-        lastHoldOk = options.firstOrNull { it.name == HOLD + ESCAPE }?.let { MoveRule.ok(it, hullLimit) } ?: true
+        lastHoldOk = options.firstOrNull { it.name == STANDOFF }?.let { MoveRule.ok(it, hullLimit) } ?: true
         lastVanillaBackOffFree = options.firstOrNull { it.name == BACK_OFF }?.let { MoveRule.ok(it, hullLimit) && it.cost <= 0f } ?: false
         if (options.none { it.kind == MoveKind.HOLD }) {
             standDown()
@@ -206,6 +217,7 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
         choice = c
         driven = c.option?.let { o -> fresh.firstOrNull { it.name == o.name } } ?: fresh.firstOrNull { it.name == HOLD }
         this.target = target
+        ship.setCustomData(TARGET, target)
         ship.setCustomData(TRACE, c.reason)
         ship.setCustomData(OPTION, c.option?.name)
         return c
@@ -230,19 +242,39 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
         // make vanilla maneuver on the ship CAT predicted against, so the range flags apply to it. Vanilla takes
         // the override when it next picks a maneuver and then clears it, so it is set every frame (as vanilla's
         // own DarkenedGazeSystemAI does)
+        if (c.state != MoveState.HOLD) holdRange = -1f
+        val standoffRange = driven?.takeIf { it.name == STANDOFF }?.standoffRange?.takeIf { it > 0f }
+        if (target != null && c.state == MoveState.HOLD) {
+            if (standoffRange != null) {
+                // vanilla's strafe backs up only once it is 100 inside its range: start that at the standoff
+                holdRange = standoffRange + STANDOFF_BAND
+                holdTarget = target
+            } else if (holdRange < 0f || holdTarget !== target) {
+                // no standoff (no prediction for it): the range it had when it started holding
+                holdRange = MathUtils.getDistance(ship.location, target.location)
+                holdTarget = target
+            }
+        }
         if (target != null) {
             val ai = ship.shipAI
             ai?.setTargetOverride(target)
-            // a maneuver vanilla picked earlier runs for 2-5 s; when it is on another ship, have it re-pick now
-            // (at most once a second, so vanilla's own maneuvers still get to run)
             val now = Global.getCombatEngine()?.getTotalElapsedTime(false) ?: 0f
-            if (ai != null && VanillaTarget.of(ship) !== target && now - lastRepick >= REPICK_INTERVAL) {
+            // ADVANCE and HOLD: hand vanilla the strafe maneuver itself (the override doesn't count while an order
+            // brings its own maneuver, e.g. escorting the flagship), re-issued before it runs out
+            val centre = when (c.state) {
+                MoveState.ADVANCE -> driven?.approachRange?.takeIf { it > 0f }
+                MoveState.HOLD -> holdRange.takeIf { it > 0f }
+                else -> null
+            }
+            val issued = centre != null && issueStrafe(now, target, centre - ship.collisionRadius - target.collisionRadius)
+            // otherwise: a maneuver vanilla picked earlier runs for 2-5 s; when it is on another ship, have it
+            // re-pick now (at most once a second, so vanilla's own maneuvers still get to run)
+            if (!issued && ai != null && VanillaTarget.of(ship) !== target && now - lastRepick >= REPICK_INTERVAL) {
                 ai.cancelCurrentManeuver()
                 lastRepick = now
             }
-        }
+        } else { issuedTarget = null; issuedManeuver = null }
         val flags = ship.aiFlags
-        if (c.state != MoveState.HOLD) holdRange = -1f
         when (c.state) {
             MoveState.ADVANCE -> {
                 flags.setFlag(AIFlags.DO_NOT_BACK_OFF, FLAG_DURATION)
@@ -256,15 +288,16 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
                 if (range > 0f) flags.setFlag(AIFlags.BACK_OFF_MAX_RANGE, FLAG_DURATION, range + Pursuit.PRESS_IN)
             }
             MoveState.HOLD -> {
-                flags.setFlag(AIFlags.DO_NOT_BACK_OFF, FLAG_DURATION)
+                // the standoff backs up as enemies close: vanilla's strafe does that only without DO_NOT_BACK_OFF
+                // (it also backs up with worse flux than its target, which only adds distance). Keeping still
+                // without a standoff stops it backing off at all
+                if (standoffRange != null) flags.unsetFlag(AIFlags.DO_NOT_BACK_OFF)
+                else flags.setFlag(AIFlags.DO_NOT_BACK_OFF, FLAG_DURATION)
                 flags.unsetFlag(AIFlags.BACK_OFF)
                 flags.unsetFlag(AIFlags.DO_NOT_PURSUE)
-                // hold the range it had when it started holding: no closer (vanilla would press in), no further
+                // the standoff's range (or the one it had when it started holding): no closer (vanilla would press
+                // in), no further
                 if (target != null) {
-                    if (holdRange < 0f || holdTarget !== target) {
-                        holdRange = MathUtils.getDistance(ship.location, target.location)
-                        holdTarget = target
-                    }
                     flags.setFlag(AIFlags.BACK_OFF_MIN_RANGE, FLAG_DURATION, holdRange)
                     flags.setFlag(AIFlags.BACK_OFF_MAX_RANGE, FLAG_DURATION, holdRange)
                 }
@@ -306,6 +339,22 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
             }
         }
         applySystem(c)
+    }
+
+    /**
+     * The strafe maneuver on [target] at [surface] range (plan §8.4): handed over again as soon as vanilla runs
+     * something else (it ran out, or vanilla picked another), or the target or range changed. When the current
+     * maneuver can't be read, on a timer instead. False when vanilla's AI can't take one.
+     */
+    private fun issueStrafe(now: Float, target: ShipAPI, surface: Float): Boolean {
+        val last = issuedManeuver
+        if (last != null && issuedTarget === target && abs(surface - issuedRange) <= RANGE_TOLERANCE) {
+            val current = VanillaManeuver.isCurrent(ship, last)
+            if (current == true || (current == null && now - issuedAt < REISSUE_INTERVAL)) return true
+        }
+        val maneuver = VanillaManeuver.strafe(ship, target, surface, MANEUVER_SECONDS) ?: return false
+        issuedManeuver = maneuver; issuedAt = now; issuedTarget = target; issuedRange = surface
+        return true
     }
 
     /** Vanilla backs off on the BACK_OFF flag unless its AI config forbids it outside a vent (automated ships). */
@@ -351,6 +400,8 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
         /** Custom-data keys: the latest decision's reason line, and the option it drives. */
         const val TRACE = "CAT_MOVE_TRACE"
         const val OPTION = "CAT_MOVE_OPTION"
+        /** The ship CAT advances on and backs off from (for the trace). */
+        const val TARGET = "CAT_MOVE_TARGET"
         private const val FLAG_DURATION = 0.1f
         /** Disengage range when nothing commits (v1's value), and the clamp on the computed one. */
         private const val DEFAULT_CLEAR_RANGE = 2500f
@@ -362,6 +413,17 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
         /** Suffix of the options judged "do it, then escape". */
         const val ESCAPE = "~"
         private const val REPICK_INTERVAL = 1f
+        /** A handed-over strafe maneuver lasts [MANEUVER_SECONDS] (vanilla: +-0.5 s); re-issued after this. */
+        private const val REISSUE_INTERVAL = 1f
+        private const val MANEUVER_SECONDS = 3f
+        /**
+         * Translation of obfuscated code (StrafeTargetManeuverV2): the strafe closes in beyond its range + 20 and
+         * backs up only inside its range - 100. The standoff flies its range + this, so it backs up at the standoff
+         * and never sits closer than the sim has it.
+         */
+        private const val STANDOFF_BAND = 100f
+        /** A range change bigger than this re-issues the maneuver at once. */
+        private const val RANGE_TOLERANCE = 50f
         /** Friendly ships within this range count as help; within [ALLY_CLOSE] the ship is already with them. */
         private const val ALLY_RANGE = 3000f
         private const val ALLY_CLOSE = 300f

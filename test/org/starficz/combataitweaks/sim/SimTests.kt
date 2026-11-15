@@ -24,7 +24,7 @@ internal fun ship(
     forward: Boolean = false, back: Boolean = false, left: Boolean = false, right: Boolean = false,
     silence: Float = 0f, parent: String? = null, offDist: Float = 0f, offAngle: Float = 0f,
     carrier: String? = null, wingRange: Float = 0f, maneuverTarget: String? = null, maneuverRange: Float? = null,
-    backOff: BackOffTraits? = null,
+    backOff: BackOffTraits? = null, gunReach: Float = reach,
 ) = SimShip(
     id, owner, hull, radius, x, y, vx, vy, facing, 0f,
     maxSpeed, accel, decel, turnAccel, maxTurn, 1f, maxSpeed,
@@ -32,7 +32,7 @@ internal fun ship(
     silence, 0f, false, system,
     reach, engagement, bestOffset, maneuverTarget, maneuverRange,
     carrier, wingRange, parent, offDist, offAngle, 0f,
-    backOff = backOff,
+    backOff = backOff, gunReach = gunReach,
 )
 
 private fun weapon(

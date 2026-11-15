@@ -105,16 +105,38 @@ class FireDiscipline(
     /** Added to the threshold: [SLOWER_TARGET] for enemies (conservative: they fire as long as vanilla ever does). */
     private val bonus: Float = 0f,
 ) {
+    // the weapons by sustained flux cost, cheapest first: sorted once per weapon list (it doesn't change)
+    private var orderOf: List<SimWeapon>? = null
+    private var order = IntArray(0)
+    private var costs = FloatArray(0)
+
+    private fun orderFor(weapons: List<SimWeapon>): IntArray {
+        if (orderOf === weapons) return order
+        val n = weapons.size
+        val c = FloatArray(n) { perSecond(weapons[it]) }
+        val o = IntArray(n) { it }
+        // insertion sort: stable like sortedBy, and a ship has few weapons
+        for (a in 1 until n) {
+            val k = o[a]
+            var b = a - 1
+            while (b >= 0 && c[o[b]] > c[k]) { o[b + 1] = o[b]; b-- }
+            o[b + 1] = k
+        }
+        orderOf = weapons; order = o; costs = c
+        return o
+    }
+
     fun toggle(weapons: List<SimWeapon>, gate: FluxGate, target: HullClass?, enabled: BooleanArray) {
         val level = gate.level()
         var budget = max(0f, dissipation - upkeep) * NEUTRAL_SHARE
-        val order = weapons.indices.sortedBy { perSecond(weapons[it]) }
+        val order = orderFor(weapons)
+        val costs = costs
         var threshold = BASE_THRESHOLD + bonus
         if (target != null && target.ordinal >= ownClass.ordinal) {
             threshold += SIZE_STEP * max(0, ownClass.ordinal - target.ordinal + 1)
         }
         for (k in order) {
-            val cost = perSecond(weapons[k])
+            val cost = costs[k]
             if (cost <= 0f) { enabled[k] = level < 0.95f; continue }
             if (cost <= budget) { enabled[k] = true; budget -= cost; continue }
             if (gate.available() / cost < MIN_SECONDS) { enabled[k] = false; continue }

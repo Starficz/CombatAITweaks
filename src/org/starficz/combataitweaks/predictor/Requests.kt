@@ -34,6 +34,8 @@ class RequestResult(
     val approachRange: Float,
     /** Distance at which no committed enemy would commit any more (0 when none commits). */
     val clearRange: Float,
+    /** `STANDOFF`: the centre-to-centre range to the target it wants now (plan §13.4); 0 otherwise. */
+    val standoffRange: Float = 0f,
     /** How enemies reacted to the ship's fire in this branch (plan §13.8), by enemy id. */
     val reactions: Map<String, Reaction> = emptyMap(),
 )

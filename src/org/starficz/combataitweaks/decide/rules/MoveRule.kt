@@ -38,6 +38,11 @@ class MoveOption(
     val escape: Boolean = false,
     /** What it trades (plan §13.3); null when not predicted (then it counts as favourable). */
     val trade: Trade? = null,
+    /**
+     * The standoff `HOLD` (plan §13.4): it keeps out of reach for the whole horizon, so its own branch is both its
+     * safety and its flux. Wins over `HOLD~` and plain `HOLD` (then kept for the vent) in judging the `HOLD` state.
+     */
+    val standoff: Boolean = false,
 ) {
     val cost get() = MoveRule.cost(armorLost, hullLost)
 }
@@ -72,16 +77,18 @@ class MoveChoice(
 
 /**
  * The movement decision (plan §8.2). Over the horizon an option is ok with no overload and hull lost within the
- * limit; its cost is hull x 3 + armor. Each of `ADVANCE` and `HOLD` has two branches, one per question:
- * - safety reads the "then escape" variant (`ADVANCE~`, `HOLD~`): doing it for the reaction time and then backing
- *   off must still be ok (the ship re-decides every tick, so that is the real risk);
- * - the flux limits read the plain one (`ADVANCE`: close to range and stay; `HOLD`: keep still), the flux it builds
- *   if it keeps doing it.
+ * limit; its cost is hull x 3 + armor. `ADVANCE` has two branches, one per question:
+ * - safety reads the "then escape" variant (`ADVANCE~`): doing it for the reaction time and then backing off must
+ *   still be ok (the ship re-decides every tick, so that is the real risk);
+ * - the flux limits read the plain one (`ADVANCE`: close to range and stay), the flux it builds if it keeps doing it.
+ *
+ * `HOLD` is the standoff (plan §13.4, `STANDOFF`): just outside every enemy's gun reach, so its one branch answers
+ * both. Without one (no target) it falls back to `HOLD~` for safety and keeping still (`HOLD`) for flux.
  *
  * | state       | when                                                                  | drives                     |
  * |-------------|-----------------------------------------------------------------------|----------------------------|
  * | `ADVANCE`   | `ADVANCE~` ok, `ADVANCE` end flux <= forceAdvance, end hard flux <= its level, `ADVANCE` trades favourably ([favourable]) | `ADVANCE~` (+system to close a gap at low flux) |
- * | `HOLD`      | `HOLD~` ok, `HOLD` end flux <= backoff level, end hard flux <= its level   | `HOLD~`               |
+ * | `HOLD`      | `STANDOFF` ok, its end flux <= backoff level, end hard flux <= its level | `STANDOFF`          |
  * | `BACK_OFF`  | some back-off ok                                                      | the cheapest ok one        |
  * | `DISENGAGE` | nothing ok; kept until flux < reengage level                          | the cheapest back-off      |
  *
@@ -121,6 +128,24 @@ object MoveRule {
         return t.dealtFlux > TRADE_EPS && t.dealtFlux >= t.takenFlux
     }
 
+    /**
+     * Kiting (plan §13.4): the standoff [hold] deals damage or flux while taking no damage, closing in ([advance],
+     * kept up the whole horizon) takes more, and it doesn't beat its trade: more net damage share (dealt - taken), or more
+     * net flux share at no worse net damage. Then holding at the standoff wins over advancing into the enemy's guns.
+     */
+    fun kitesBetter(hold: MoveOption, advance: MoveOption?): Boolean {
+        if (!hold.standoff) return false
+        val s = hold.trade ?: return false
+        if (s.takenDamage > TRADE_EPS || (s.dealtDamage <= TRADE_EPS && s.dealtFlux <= TRADE_EPS)) return false
+        val a = advance?.trade ?: return true
+        // closing in costs nothing more (nothing reaches it there either): no reason to hang back
+        if (a.takenDamage <= s.takenDamage + TRADE_EPS && a.takenFlux <= s.takenFlux + TRADE_EPS) return false
+        val dS = s.dealtDamage - s.takenDamage; val dA = a.dealtDamage - a.takenDamage
+        val fS = s.dealtFlux - s.takenFlux; val fA = a.dealtFlux - a.takenFlux
+        val advanceBetter = dA > dS + TRADE_EPS || (dA >= dS - TRADE_EPS && fA > fS + TRADE_EPS)
+        return !advanceBetter
+    }
+
     /** The state the rule wants now, with its option (before hysteresis). */
     fun decide(i: MoveInputs): MoveChoice = choose(wanted(i), i)
 
@@ -130,14 +155,15 @@ object MoveRule {
         val stand = stand(i)
         val advance = judged(i, MoveKind.ADVANCE)
         val advanceFlux = keepingOn(i, MoveKind.ADVANCE) ?: stand ?: advance
+        val hold = judged(i, MoveKind.HOLD)
+        val holdFlux = if (hold?.standoff == true) hold else stand ?: hold
+        val holdOk = hold != null && ok(hold, i.hullLimit) && fluxBelow(holdFlux!!, i.backoffIfFluxAboveLevel, i)
+        val fullAdvance = keepingOn(i, MoveKind.ADVANCE)
         if (advance != null && ok(advance, i.hullLimit) && fluxBelow(advanceFlux!!, i.forceAdvanceIfFluxBelowLevel, i) &&
-            favourable(keepingOn(i, MoveKind.ADVANCE)?.trade)) {
+            favourable(fullAdvance?.trade) && !(holdOk && kitesBetter(hold!!, fullAdvance))) {
             return MoveState.ADVANCE
         }
-        val hold = judged(i, MoveKind.HOLD)
-        if (hold != null && ok(hold, i.hullLimit) && fluxBelow(stand ?: hold, i.backoffIfFluxAboveLevel, i)) {
-            return MoveState.HOLD
-        }
+        if (holdOk) return MoveState.HOLD
         if (i.options.any { it.kind == MoveKind.BACK_OFF && ok(it, i.hullLimit) }) return MoveState.BACK_OFF
         return MoveState.DISENGAGE
     }
@@ -148,14 +174,17 @@ object MoveRule {
     /** Plain `HOLD`: keeping still for the whole horizon. */
     private fun stand(i: MoveInputs) = keepingOn(i, MoveKind.HOLD)
 
-    /** The plain option of a kind: kept up for the whole horizon (no escape, no system). */
+    /** The plain option of a kind: kept up for the whole horizon (no escape, no system, not the standoff). */
     private fun keepingOn(i: MoveInputs, kind: MoveKind) =
-        i.options.firstOrNull { it.kind == kind && !it.system && !it.escape }
+        i.options.firstOrNull { it.kind == kind && !it.system && !it.escape && !it.standoff }
 
-    /** The option a state is judged by: its "then escape" variant when there is one, else the plain one. */
+    /**
+     * The option a state is judged by: the standoff, else its "then escape" variant when there is one, else the
+     * plain one.
+     */
     private fun judged(i: MoveInputs, kind: MoveKind): MoveOption? {
         val candidates = i.options.filter { it.kind == kind && !it.system }
-        return candidates.firstOrNull { it.escape } ?: candidates.firstOrNull()
+        return candidates.firstOrNull { it.standoff } ?: candidates.firstOrNull { it.escape } ?: candidates.firstOrNull()
     }
 
     /** [state] with the option it drives and the reason line. */
@@ -170,7 +199,7 @@ object MoveRule {
                 ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF && !it.system })
         }
         val head = if (option != null) "$state ${option.name}" else "$state (no option)"
-        return MoveChoice(state, option, head + ": " + table(i))
+        return MoveChoice(state, option, if (Explain.enabled) head + ": " + table(i) else head)
     }
 
     /** `ADVANCE`, or its system variant to close a real gap while keeping still would leave flux low. */
@@ -245,8 +274,8 @@ class MoveDecider(private val delay: Float = 0.5f) {
             return wanted
         }
         val held = MoveRule.choose(current!!, i)
-        return MoveChoice(held.state, held.option,
-            held.reason + " (wants %s for %.1fs)".format(wanted.state, now - pendingSince))
+        return MoveChoice(held.state, held.option, if (!Explain.enabled) held.reason
+            else held.reason + " (wants %s for %.1fs)".format(wanted.state, now - pendingSince))
     }
 
     fun reset() {

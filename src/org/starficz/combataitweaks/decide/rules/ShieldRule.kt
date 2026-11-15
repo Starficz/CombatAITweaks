@@ -44,12 +44,17 @@ object ShieldRule {
         val next = i.nextShieldHit ?: return ShieldChoice(false, "KEEP: no prediction")
         i.liveThreat?.let { return ShieldChoice(false, "KEEP: $it") }
         if (next <= i.window) {
-            return ShieldChoice(false, "KEEP: shield hit in %.2fs, needs %.2fs".format(next, i.window))
+            return ShieldChoice(false, if (!Explain.enabled) "KEEP: shield hit within the window"
+                else "KEEP: shield hit in %.2fs, needs %.2fs".format(next, i.window))
         }
         val down = min(GAIN_HORIZON, next - i.window)
         val gain = gain(i, down)
         val min = max(MIN_GAIN, MIN_GAIN_SHARE * i.maxFlux)
-        if (gain < min) return ShieldChoice(false, "KEEP: gains %.0f flux in %.1fs (< %.0f)".format(gain, down, min), gain)
+        if (gain < min) {
+            return ShieldChoice(false, if (!Explain.enabled) "KEEP: gains too little"
+                else "KEEP: gains %.0f flux in %.1fs (< %.0f)".format(gain, down, min), gain)
+        }
+        if (!Explain.enabled) return ShieldChoice(true, "DROP", gain)
         val gap = if (next == Float.MAX_VALUE) "none predicted" else "next shield hit in %.2fs".format(next)
         return ShieldChoice(true, "DROP: $gap, gains %.0f flux in %.1fs".format(gain, down), gain)
     }

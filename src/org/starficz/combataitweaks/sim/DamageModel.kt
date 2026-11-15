@@ -34,24 +34,107 @@ class DamageRules(
  * The shooter's damage bonuses (weapon type, beam, vs this hull size) are already applied.
  */
 class Hit(
-    val time: Float,
+    var time: Float,
     /** Damage of this hit; for beams, the damage of one tick. */
-    val damage: Float,
+    var damage: Float,
     /** Hit strength against armor; for beams the beam's DPS (the armor rule applies `dpsToHitStrengthMult`). */
-    val hitStrength: Float,
-    val emp: Float,
-    val kind: DamageKind,
-    val delivery: Delivery,
+    var hitStrength: Float,
+    var emp: Float,
+    var kind: DamageKind,
+    var delivery: Delivery,
     /** Beam damage on shields is soft flux unless the weapon forces hard flux. */
-    val softFlux: Boolean,
+    var softFlux: Boolean,
     /** From an ammo-limited weapon that waits for the shield to drop instead of firing into it. */
-    val conservative: Boolean,
+    var conservative: Boolean,
     /** World point the hit comes from: the shooter, or where the projectile was just before impact. */
-    val fromX: Float,
-    val fromY: Float,
+    var fromX: Float,
+    var fromY: Float,
     /** Shooter ship id, or "in flight" for shots already fired. */
-    val sourceId: String,
-)
+    var sourceId: String,
+) {
+    internal fun set(
+        time: Float, damage: Float, hitStrength: Float, emp: Float, kind: DamageKind, delivery: Delivery,
+        softFlux: Boolean, conservative: Boolean, fromX: Float, fromY: Float, sourceId: String,
+    ): Hit {
+        this.time = time; this.damage = damage; this.hitStrength = hitStrength; this.emp = emp; this.kind = kind
+        this.delivery = delivery; this.softFlux = softFlux; this.conservative = conservative
+        this.fromX = fromX; this.fromY = fromY; this.sourceId = sourceId
+        return this
+    }
+}
+
+/**
+ * Reusable [Hit]s and float arrays for one worker thread's branch: what a damage run needs only while it runs
+ * (garbage otherwise: enemy beams alone make ten hits a second per beam per branch; threat rankings, firing flux,
+ * missile tracking and armor grid copies were most of the rest). The caller resets it when the last run's scratch
+ * is no longer read: everything obtained since is then handed out again. Only for runs whose hits nobody keeps
+ * ([DamageResult.hits] is empty then); outcomes never come from here.
+ */
+class Scratch {
+    private val pool = ArrayList<Hit>(1024)
+    private var used = 0
+    /** Arrays by size (a slab each: the steps, and each armor grid's cell count); few sizes, so a linear lookup. */
+    private class Slab(val size: Int) {
+        val arrays = ArrayList<FloatArray>(64)
+        var used = 0
+    }
+    private var slabs = arrayOfNulls<Slab>(8)
+    private var slabCount = 0
+
+    fun reset() {
+        used = 0
+        for (k in 0 until slabCount) slabs[k]!!.used = 0
+    }
+
+    /** A float array of [size] filled with [fill], valid until the next [reset]. */
+    fun floats(size: Int, fill: Float = 0f): FloatArray {
+        val slab = slab(size)
+        val a: FloatArray
+        if (slab.used < slab.arrays.size) {
+            a = slab.arrays[slab.used]
+            java.util.Arrays.fill(a, fill)
+        } else {
+            a = FloatArray(size)
+            if (fill != 0f) java.util.Arrays.fill(a, fill)
+            slab.arrays += a
+        }
+        slab.used++
+        return a
+    }
+
+    private fun slab(size: Int): Slab {
+        for (k in 0 until slabCount) if (slabs[k]!!.size == size) return slabs[k]!!
+        if (slabCount == slabs.size) slabs = slabs.copyOf(slabCount * 2)
+        return Slab(size).also { slabs[slabCount++] = it }
+    }
+
+    internal fun obtain(
+        time: Float, damage: Float, hitStrength: Float, emp: Float, kind: DamageKind, delivery: Delivery,
+        softFlux: Boolean, conservative: Boolean, fromX: Float, fromY: Float, sourceId: String,
+    ): Hit {
+        if (used < pool.size) {
+            return pool[used++].set(time, damage, hitStrength, emp, kind, delivery, softFlux, conservative, fromX, fromY, sourceId)
+        }
+        val h = Hit(time, damage, hitStrength, emp, kind, delivery, softFlux, conservative, fromX, fromY, sourceId)
+        pool += h
+        used++
+        return h
+    }
+
+    companion object {
+        private val local = ThreadLocal.withInitial { Scratch() }
+
+        /** This thread's pool. */
+        fun local(): Scratch = local.get()
+    }
+}
+
+/** A hit from [this] pool, or a new one without a pool. */
+internal fun Scratch?.hit(
+    time: Float, damage: Float, hitStrength: Float, emp: Float, kind: DamageKind, delivery: Delivery,
+    softFlux: Boolean, conservative: Boolean, fromX: Float, fromY: Float, sourceId: String,
+): Hit = this?.obtain(time, damage, hitStrength, emp, kind, delivery, softFlux, conservative, fromX, fromY, sourceId)
+    ?: Hit(time, damage, hitStrength, emp, kind, delivery, softFlux, conservative, fromX, fromY, sourceId)
 
 // ---------------------------------------------------------------------------------------------------------- weapons
 

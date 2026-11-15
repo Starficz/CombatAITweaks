@@ -6,19 +6,21 @@ import org.starficz.combataitweaks.decide.MoveKind
 import org.starficz.combataitweaks.decide.MoveOption
 import org.starficz.combataitweaks.decide.MoveRule
 import org.starficz.combataitweaks.decide.MoveState
+import org.starficz.combataitweaks.decide.Trade
 
 // Unit tests for the movement decision (plan §8.2) and the branches it reads (plan §7).
 
 private fun opt(
     name: String, hull: Float = 0f, armor: Float = 0f, overloadsIn: Float = -1f, flux: Float = 0.3f,
-    hard: Float = 0.1f,
+    hard: Float = 0.1f, trade: Trade? = null,
 ): MoveOption {
     val kind = when {
         name.startsWith("ADVANCE") -> MoveKind.ADVANCE
         name.startsWith("BACK_OFF") -> MoveKind.BACK_OFF
         else -> MoveKind.HOLD
     }
-    return MoveOption(name, kind, name.endsWith("+SYSTEM"), hull, armor, overloadsIn, flux, hard, escape = name.contains("~"))
+    return MoveOption(name, kind, name.endsWith("+SYSTEM"), hull, armor, overloadsIn, flux, hard, escape = name.contains("~"),
+        trade = trade, standoff = name == "STANDOFF")
 }
 
 private fun moveInputs(
@@ -53,6 +55,12 @@ internal fun moveRule() {
     check(noEscape.state == MoveState.BACK_OFF && noEscape.option?.name == "BACK_OFF",
         "move: even holding a moment loses the escape -> BACK_OFF") { noEscape.reason }
     check(noEscape.reason.contains("HOLD~ ovl 4.0s"), "move: the reason line lists each option's numbers") { noEscape.reason }
+    // without the trace the rule skips the numbers, and decides the same
+    org.starficz.combataitweaks.decide.Explain.enabled = false
+    val terse = MoveRule.decide(moveInputs(*set(holdEsc = opt("HOLD~", overloadsIn = 4f), advEsc = opt("ADVANCE~", overloadsIn = 3f))))
+    org.starficz.combataitweaks.decide.Explain.enabled = true
+    check(terse.state == noEscape.state && terse.option?.name == noEscape.option?.name && terse.reason == "BACK_OFF BACK_OFF",
+        "move: without explanations the same decision, a short reason") { terse.reason }
 
     // flux limits read keeping still (v1's hold-branch flux ratio)
     val warm = MoveRule.decide(moveInputs(*set(hold = opt("HOLD", flux = 0.8f))))
@@ -107,6 +115,34 @@ internal fun moveRule() {
     val near = MoveRule.decide(moveInputs(*set(hold = opt("HOLD", flux = 0.2f)), opt("ADVANCE~+SYSTEM"), gap = 100f))
     check(near.option?.name == "ADVANCE~", "move: already near range -> no system to advance") { near.reason }
 
+    // the standoff (plan §13.4): HOLD is judged by it and flies it; keeping still stays for the vent only
+    val stillOverloads = opt("HOLD", overloadsIn = 3f)
+    val standoff = MoveRule.decide(moveInputs(opt("STANDOFF"), stillOverloads, opt("ADVANCE~", overloadsIn = 4f), opt("BACK_OFF")))
+    check(standoff.state == MoveState.HOLD && standoff.option?.name == "STANDOFF",
+        "move: the standoff is ok while keeping still overloads -> HOLD on the standoff") { standoff.reason }
+    val standoffHot = MoveRule.decide(moveInputs(opt("STANDOFF", flux = 0.9f), opt("HOLD"), opt("ADVANCE~", overloadsIn = 4f), opt("BACK_OFF")))
+    check(standoffHot.state == MoveState.BACK_OFF, "move: the standoff's own end flux is its flux limit") { standoffHot.reason }
+    val standoffCaught = MoveRule.decide(moveInputs(opt("STANDOFF", overloadsIn = 6f), opt("HOLD~"), opt("HOLD"),
+        opt("ADVANCE~", overloadsIn = 4f), opt("BACK_OFF")))
+    check(standoffCaught.state == MoveState.BACK_OFF, "move: a standoff that gets caught isn't ok, whatever HOLD~ says") { standoffCaught.reason }
+    val advanceFlux = MoveRule.decide(moveInputs(opt("STANDOFF", flux = 0.8f), opt("HOLD", flux = 0.3f), opt("ADVANCE~")))
+    check(advanceFlux.state == MoveState.ADVANCE, "move: the advance flux fallback is keeping still, not the standoff") { advanceFlux.reason }
+
+    // kiting: the standoff deals damage for free, so closing in must beat its trade
+    fun kiteCase(standoffTrade: Trade, advanceTrade: Trade) = MoveRule.decide(moveInputs(
+        opt("STANDOFF", trade = standoffTrade), opt("HOLD"), opt("ADVANCE~"), opt("ADVANCE", trade = advanceTrade), opt("BACK_OFF")))
+    val kite = kiteCase(Trade(0.10f, 0f, 0.30f, 0.10f), Trade(0.12f, 0.05f, 0.35f, 0.30f))
+    check(kite.state == MoveState.HOLD && kite.option?.name == "STANDOFF",
+        "move: kiting for free beats advancing into the enemy's guns") { kite.reason }
+    val kill = kiteCase(Trade(0.10f, 0f, 0.30f, 0.10f), Trade(0.40f, 0.02f, 0.50f, 0.20f))
+    check(kill.state == MoveState.ADVANCE, "move: advancing that deals much more net damage still advances") { kill.reason }
+    val same = kiteCase(Trade(0.82f, 0f, 0f, 0f), Trade(0.82f, 0f, 0f, 0f))
+    check(same.state == MoveState.ADVANCE, "move: nothing reaches it closer in either -> ADVANCE, not a standoff tie") { same.reason }
+    val outranged = kiteCase(Trade(0f, 0f, 0f, -0.05f), Trade(0f, 0f, 0.20f, 0.20f))
+    check(outranged.state == MoveState.ADVANCE, "move: a standoff that deals nothing doesn't stop an even flux trade") { outranged.reason }
+    val pelted = kiteCase(Trade(0.10f, 0.05f, 0.30f, 0.10f), Trade(0.10f, 0.08f, 0.30f, 0.30f))
+    check(pelted.state == MoveState.ADVANCE, "move: a standoff that takes damage isn't kiting (the trade rule decides)") { pelted.reason }
+
     val venting = MoveRule.decide(moveInputs(*set(), venting = true, ventOption = "HOLD"))
     check(venting.state == MoveState.VENTING && venting.option?.name == "HOLD", "move: venting drives the vent's option") { venting.reason }
 
@@ -145,9 +181,63 @@ internal fun moveBranches() {
     check(at1s > 50f && thenEscape.x[thenEscape.steps - 1] < at1s - 300f,
         "branch: then-escape advances first, then backs away") { "x at 1 s $at1s, end ${thenEscape.x[thenEscape.steps - 1]}" }
 
+    standoffBranches()
+
     // clear range: reach 700 + radii (50 + 50) + the 10 s horizon x (300 - 150) faster
     val chaser = ship("c", owner = 1, x = 1200f, reach = 700f, radius = 50f, maxSpeed = 300f)
     val slow = ship("s", x = 0f, maxSpeed = 150f, radius = 50f)
     val clear = World(listOf(slow, chaser), SimParams(200)).branch("s", OwnPlan.Hold())
     near(clear.clearRange, 700f + 100f + 10f * 150f, 1f, "branch: clear range = reach + radii + closing over the horizon")
+}
+
+/** The standoff path (plan §13.4): out of every hostile's gun reach, at the ship's own range when that is farther. */
+private fun standoffBranches() {
+    fun minDistance(a: Timeline, b: Timeline) = (0 until a.steps).minOf { length(a.x[it] - b.x[it], a.y[it] - b.y[it]) }
+
+    // a slow enemy with short guns closes in: the ship keeps its own range (700 + radii - 200 = 600) while it is
+    // farther than the enemy's standoff (300 + radii + 100 margin = 500), backing off as it comes
+    val p = ship("p", x = 0f, engagement = 700f, reach = 700f, maxSpeed = 200f, accel = 200f, decel = 200f)
+    val slow = ship("e", owner = 1, x = 900f, facing = 180f, reach = 300f, engagement = 300f, maxSpeed = 80f, accel = 80f, decel = 80f)
+    val kite = World(listOf(p, slow), SimParams(200)).branch("p", OwnPlan.Standoff("e"))
+    check("e" in kite.committed, "standoff: the slow enemy commits and closes in")
+    near(kite.standoffRange, 600f, 0.1f, "standoff: outranging it, the ship's own range")
+    val kp = kite.timelines["p"]!!; val ke = kite.timelines["e"]!!
+    check(minDistance(kp, ke) >= 500f, "standoff: never inside the slow enemy's reach") { "closest ${minDistance(kp, ke)}" }
+    // it closes from 900 to its 600 first, then gives ground as the enemy comes on
+    val peak = kp.x.max()
+    check(peak > 200f && kp.x[kp.steps - 1] < peak - 150f, "standoff: closes in, then backs off as the enemy closes") {
+        "peak x $peak, end x ${kp.x[kp.steps - 1]}"
+    }
+
+    // outranged: it waits at the enemy's standoff (900 + 100 + 100 = 1100), closing in from far away
+    val longGuns = ship("e", owner = 1, x = 3000f, facing = 180f, reach = 900f, engagement = 900f, maxSpeed = 0f)
+    val wait = World(listOf(p, longGuns), SimParams(200)).branch("p", OwnPlan.Standoff("e"))
+    near(wait.standoffRange, 1100f, 0.1f, "standoff: outranged, just outside the enemy's gun reach")
+    val wp = wait.timelines["p"]!!
+    near(3000f - wp.x[wp.steps - 1], 1100f, 60f, "standoff: closes in from far away to the edge of reach")
+
+    // missiles don't count: their ammo runs out, and a standoff beyond them would never engage
+    val missileBoat = ship("e", owner = 1, x = 3000f, facing = 180f, reach = 2000f, gunReach = 600f, engagement = 600f,
+        maxSpeed = 0f)
+    val noMissiles = World(listOf(p, missileBoat), SimParams(200)).branch("p", OwnPlan.Standoff("e"))
+    near(noMissiles.standoffRange, 800f, 0.1f, "standoff: gun reach, not missile reach")
+
+    // another hostile near the line: pushed out past its reach. Target at 0 (standoff 700), the ship at -2000, the
+    // other at (-1000, 300) with standoff 700: d = 1000 + sqrt(1000^2 - (1000^2 + 300^2 - 700^2)) = 1632
+    val far = ship("p", x = -2000f, engagement = 700f, maxSpeed = 200f, accel = 200f, decel = 200f)
+    val t = ship("t", owner = 1, x = 0f, reach = 500f, maxSpeed = 0f)
+    val side = ship("h", owner = 1, x = -1000f, y = 300f, reach = 500f, maxSpeed = 0f)
+    val pushed = World(listOf(far, t, side), SimParams(200)).branch("p", OwnPlan.Standoff("t"))
+    near(pushed.standoffRange, 1632.5f, 1f, "standoff: pushed out past another hostile's reach")
+    // right behind the ship, far enough that no point on the line is out of reach: the target's own standoff
+    val behind = ship("h", owner = 1, x = -1500f, reach = 500f, maxSpeed = 0f)
+    val sandwiched = World(listOf(far, t, behind), SimParams(200)).branch("p", OwnPlan.Standoff("t"))
+    near(sandwiched.standoffRange, 700f, 1f, "standoff: no safe point on the line -> the target's standoff (the sim shows the cost)")
+
+    // a faster enemy: the standoff can't keep it off, which the branch shows
+    val fast = ship("e", owner = 1, x = 900f, facing = 180f, reach = 300f, engagement = 300f, maxSpeed = 300f, accel = 300f, decel = 300f)
+    val slowP = ship("p", x = 0f, engagement = 700f, maxSpeed = 100f, accel = 100f, decel = 100f)
+    val caught = World(listOf(slowP, fast), SimParams(200)).branch("p", OwnPlan.Standoff("e"))
+    val cp = caught.timelines["p"]!!; val ce = caught.timelines["e"]!!
+    check(minDistance(cp, ce) < 450f, "standoff: a faster enemy still gets into reach") { "closest ${minDistance(cp, ce)}" }
 }

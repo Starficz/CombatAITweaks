@@ -24,10 +24,13 @@ import java.util.Map;
 //  threat:    a Dominator 1300 away, the Brawler alone     -> BACK_OFF / DISENGAGE, and the reason is the danger
 //  automated: the same Dominator against the Warden        -> it backs off too when caught out, by direct thrust
 //             (vanilla won't), and isn't caught
+//  standoff:  a slow Enforcer with only chainguns (450) 1300 away, against the Brawler's Arbalests (700)
+//             -> HOLD at the standoff (plan §13.4), or ADVANCE where that is out of reach too: it deals damage
+//             and takes none
 public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
     private static final Logger log = Global.getLogger(MoveCasesDriver.class);
 
-    private enum Phase { WARMUP, ADVANCE, THREAT, AUTOMATED, DONE }
+    private enum Phase { WARMUP, ADVANCE, THREAT, AUTOMATED, STANDOFF, DONE }
 
     private static final int PHASE_FRAMES = 600;
     private static final Vector2f AWAY = new Vector2f(-6000f, 6000f);
@@ -45,6 +48,7 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
     private String firstBackOffReason = null, lastReason = null;
     private float startHull = 0f;
     private String lastState = null;
+    private float startArmor = 0f, maxHardFlux = 0f, threatStartHull = 0f, threatStartArmor = 0f, threatMaxFlux = 0f;
 
     static void note(String s) {
         log.info("LIVE_CHECK note: " + s);
@@ -159,6 +163,32 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
         return engine.getFleetManager(1).spawnFleetMember(m, at, 270f, 0f);
     }
 
+    // a slow ship whose medium ballistic slots all carry chainguns (450) and nothing else: the Brawler's Arbalests
+    // (700) outrange it
+    private ShipAPI spawnShortGuns(String variantId, Vector2f at) {
+        FleetMemberAPI m = Global.getFactory().createFleetMember(com.fs.starfarer.api.fleet.FleetMemberType.SHIP, variantId);
+        com.fs.starfarer.api.combat.ShipVariantAPI v = m.getVariant().clone();
+        v.clearWeapons();
+        v.getWeaponGroups().clear();
+        for (com.fs.starfarer.api.loading.WeaponSlotAPI slot : v.getHullSpec().getAllWeaponSlotsCopy()) {
+            if (slot.getWeaponType() == com.fs.starfarer.api.combat.WeaponAPI.WeaponType.BALLISTIC
+                    && slot.getSlotSize() == com.fs.starfarer.api.combat.WeaponAPI.WeaponSize.MEDIUM) {
+                v.addWeapon(slot.getId(), "chaingun");
+            }
+        }
+        v.autoGenerateWeaponGroups();
+        m.setVariant(v, false, true);
+        m.getRepairTracker().setCR(0.7f);
+        m.setOwner(1);
+        return engine.getFleetManager(1).spawnFleetMember(m, at, 270f, 0f);
+    }
+
+    private static float armor(ShipAPI s) {
+        float sum = 0f;
+        for (float[] col : s.getArmorGrid().getGrid()) for (float c : col) sum += c;
+        return sum;
+    }
+
     private float distance(ShipAPI a, ShipAPI b) {
         return Vector2f.sub(a.getLocation(), b.getLocation(), null).length();
     }
@@ -240,6 +270,47 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
                     // not a check: under the escape rule the Warden may close in while it can still get out; what
                     // matters is that it isn't caught (reportBackOff's hull check)
                     note(String.format("automated: the Warden's mean speed away from the threat %.0f", radial));
+                    if (threat != null) engine.removeEntity(threat);
+                    threat = null;
+                    if (!frigate.isAlive()) { finish(); break; }
+                    frigate.setHitpoints(frigate.getMaxHitpoints());
+                    threat = spawnShortGuns("enforcer_Assault", new Vector2f(0f, 1300f));
+                    expect(threat != null, "standoff: chaingun Enforcer spawned 1300 away");
+                    enter(Phase.STANDOFF, frigate);
+                    startDist = 1300f;
+                    startArmor = armor(frigate);
+                    maxHardFlux = 0f;
+                    if (threat != null) {
+                        threatStartHull = threat.getHitpoints();
+                        threatStartArmor = armor(threat);
+                        threatMaxFlux = 0f;
+                    }
+                }
+                break;
+            case STANDOFF:
+                sample(threat);
+                if (age() >= 60) maxHardFlux = Math.max(maxHardFlux, frigate.getFluxTracker().getHardFlux());
+                if (threat != null && threat.isAlive()) threatMaxFlux = Math.max(threatMaxFlux, threat.getFluxTracker().getCurrFlux());
+                if (age() >= PHASE_FRAMES * 3 / 2 || !frigate.isAlive() || threat == null || !threat.isAlive()) {
+                    float hullLost = startHull - (frigate.isAlive() ? frigate.getHitpoints() : 0f);
+                    float armorLost = startArmor - (frigate.isAlive() ? armor(frigate) : 0f);
+                    float dealtHull = threat == null ? 0f : threatStartHull - (threat.isAlive() ? threat.getHitpoints() : 0f);
+                    float dealtArmor = threat == null ? 0f : threatStartArmor - (threat.isAlive() ? armor(threat) : 0f);
+                    note(String.format("standoff: states %s, distance %.0f -> min %.0f max %.0f; Brawler lost hull %.0f armor %.0f, max hard flux %.0f; "
+                                    + "Enforcer lost hull %.0f armor %.0f, max flux %.0f; last: %s",
+                            states, startDist, minDist, maxDist, hullLost, armorLost, maxHardFlux, dealtHull, dealtArmor, threatMaxFlux, lastReason));
+                    // HOLD is the standoff; ADVANCE is fine too when its range is also out of the chainguns' reach
+                    // (the Brawler's ~600 against 555): the checks below are what matters
+                    expect(share("HOLD", "ADVANCE") >= 0.9f, String.format("standoff: outranging a slow enemy -> engages, no back-off (HOLD %.0f%%, ADVANCE %.0f%% of samples)",
+                            100f * share("HOLD"), 100f * share("ADVANCE")));
+                    expect(share("HOLD") >= 0.3f, String.format("standoff: holds at the standoff part of the time (HOLD %.0f%%)", 100f * share("HOLD")));
+                    // chainguns reach 450 + the Enforcer's radius: the Brawler never sat inside that
+                    float reach = 450f + (threat == null ? 0f : threat.getCollisionRadius());
+                    expect(minDist > reach, String.format("standoff: kept out of the chainguns' reach (closest %.0f, reach %.0f)", minDist, reach));
+                    expect(hullLost <= 1f && armorLost <= 1f && maxHardFlux <= 1f,
+                            String.format("standoff: takes no damage (hull %.0f, armor %.0f, shield hard flux %.0f)", hullLost, armorLost, maxHardFlux));
+                    expect(dealtHull + dealtArmor > 0f || threatMaxFlux > 0f,
+                            String.format("standoff: deals damage (hull %.0f, armor %.0f, flux %.0f)", dealtHull, dealtArmor, threatMaxFlux));
                     finish();
                 }
                 break;

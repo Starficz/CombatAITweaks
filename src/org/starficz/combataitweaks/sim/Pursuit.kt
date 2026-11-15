@@ -73,6 +73,17 @@ object Pursuit {
     fun backOffDistance(enemy: SimShip, target: SimShip, targetingRadius: Float): Float =
         max(holdDistance(enemy, target, targetingRadius), enemy.engagementRange + enemy.collisionRadius + targetingRadius)
 
+    /** Kept between a standoff and the edge of an enemy's gun reach (plan §13.4). */
+    const val STANDOFF_MARGIN = 100f
+
+    /**
+     * Centre-to-centre distance from [enemy] that keeps a ship out of its gun reach (plan §13.4): its longest gun
+     * plus both radii, as the commit check measures reach, plus [STANDOFF_MARGIN]. Missiles are left to the damage
+     * sim: their ammo runs out, and a standoff beyond them would never engage.
+     */
+    fun standoffDistance(enemy: SimShip, targetingRadius: Float): Float =
+        enemy.gunReach + enemy.collisionRadius + targetingRadius + STANDOFF_MARGIN
+
     /**
      * Centre-to-centre distance the protected ship [ship] closes to on [target] when it advances: its own engagement
      * range + radii, pressed in like an enemy's ([holdDistance] without vanilla's live range, which CAT's own range
@@ -105,7 +116,8 @@ object Pursuit {
      */
     class Pursuer(
         val ship: SimShip,
-        val hold: Float,
+        /** Centre-to-centre range it closes to; a standoff moves it every step. */
+        var hold: Float,
         private val useSystem: Boolean = true,
         private val limitsOverride: ((Float) -> EngineLimits)? = null,
         /** How it reacts to the target's fire in this branch ([Reactions]), and the range it holds backing off. */

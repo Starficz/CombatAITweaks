@@ -81,6 +81,8 @@ class SimShip(
 
     /** When its AI backs off under flux ([Reactions]); null: never (fighters, modules, no vanilla AI). */
     val backOff: BackOffTraits? = null,
+    /** Longest range of a non-missile weapon that can fire at ships: the reach a standoff keeps out of (plan §13.4). */
+    val gunReach: Float = weaponReach,
 ) {
     val isFighter get() = hullClass == HullClass.FIGHTER
     val isModule get() = parentId != null
@@ -143,6 +145,13 @@ sealed class OwnPlan {
     class BackAway(val fromId: String, override val phases: List<MotionPhase> = emptyList()) : OwnPlan()
 
     /**
+     * The standoff (plan §13.4 `HOLD`): keep [targetId] at the closest range just outside every hostile's gun reach
+     * (or at the ship's own engagement range when that is farther), facing it with the best guns; back off as they
+     * close, close in as they leave.
+     */
+    class Standoff(val targetId: String, override val phases: List<MotionPhase> = emptyList()) : OwnPlan()
+
+    /**
      * [first] until [switchAt] seconds (shared clock), then [then]: an option judged by whether the ship can still
      * get out once it changes its mind (plan §8.2, "then escape"). Uses [first]'s phases throughout. The parts are
      * simple plans, not nested [Then]s.
@@ -165,4 +174,6 @@ class BranchResult(
      * 0 when nothing commits.
      */
     val clearRange: Float = 0f,
+    /** [OwnPlan.Standoff] only: the centre-to-centre range to the target it wants at the start; 0 otherwise. */
+    val standoffRange: Float = 0f,
 )

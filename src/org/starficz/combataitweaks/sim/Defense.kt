@@ -20,27 +20,32 @@ enum class ShieldPlan {
 }
 
 /** What the hits did to the protected ship, per simulation step (index i = state at (i + 1) * DT). */
-class DefenseOutcome(val steps: Int) {
+class DefenseOutcome(val steps: Int, detail: Boolean = true) {
     val flux = FloatArray(steps)
     val hardFlux = FloatArray(steps)
-    val shieldUp = BooleanArray(steps)
+    /**
+     * With [detail] only (the trace, the overlay and the tests read these; the decisions don't): [shieldUp],
+     * [moduleHullLost], [shieldFlux] and [potentialFlux] are empty otherwise. [potentialFluxEnd] is always kept.
+     */
+    val shieldUp = BooleanArray(if (detail) steps else 0)
     /** Cumulative hull lost by the ship itself (modules excluded). */
     val hullLost = FloatArray(steps)
     /** Cumulative hull lost by its modules. */
-    val moduleHullLost = FloatArray(steps)
+    val moduleHullLost = FloatArray(if (detail) steps else 0)
     /**
      * Largest drop of regional armor (vanilla's 21-cell armor value at a hit point) so far, in armor-rating units:
      * 0 = untouched, the armor rating = stripped bare somewhere.
      */
     val armorLost = FloatArray(steps)
     /** Cumulative flux the shield actually took. */
-    val shieldFlux = FloatArray(steps)
+    val shieldFlux = FloatArray(if (detail) steps else 0)
     /**
      * Cumulative flux every hit (except conservative ones) would put on the shield if it blocked it, whatever the
      * shield really did. v1's thresholds read this until milestone 3 replaces them.
      */
-    val potentialFlux = FloatArray(steps)
-    val potentialHardFlux = FloatArray(steps)
+    val potentialFlux = FloatArray(if (detail) steps else 0)
+    /** [potentialFlux] at the end of the horizon. */
+    var potentialFluxEnd = 0f
     /** First overload: start time and duration (-1 = none). */
     var overloadStart = -1f
     var overloadDuration = 0f
@@ -48,11 +53,16 @@ class DefenseOutcome(val steps: Int) {
     var firstHullDamage = -1f
     /**
      * Times (in order) of the hits the shield covered: taken on it, or held back by a conservative shooter until it
-     * drops. With the shield down they would land on armor (plan §13.9).
+     * drops. With the shield down they would land on armor (plan §13.9). Only up to the first one after
+     * [SHIELD_HIT_HORIZON]: the shield decision asks for the next one within half a second of the snapshot.
      */
-    val shieldHitTimes = ArrayList<Float>()
+    val shieldHitTimes = FloatList()
 
     fun at(time: Float): Int = ((time / DT).toInt() - 1).coerceIn(0, steps - 1)
+
+    companion object {
+        const val SHIELD_HIT_HORIZON = 3f
+    }
 }
 
 /**
@@ -68,6 +78,8 @@ class DefenseResolver(
     private val timeline: Timeline,
     private val omniFacing: FloatArray,
     private val moduleTimelines: Map<String, Timeline>,
+    /** Armor grid copies come from here when given (a lean run). */
+    private val scratch: Scratch? = null,
 ) {
     /**
      * @param ownFire the ship's own weapons, run each step after that step's hits on the ship's flux: they fire only
@@ -78,12 +90,12 @@ class DefenseResolver(
      */
     fun resolve(
         hits: List<Hit>, plan: ShieldPlan, ownFire: ((Int, FluxGate) -> Unit)? = null,
-        ownFiringFlux: FloatArray? = null,
+        ownFiringFlux: FloatArray? = null, detail: Boolean = true,
     ): DefenseOutcome {
         val steps = timeline.steps
-        val out = DefenseOutcome(steps)
-        val state = State(defense, rules)
-        val modules = defense.modules.map { State(it, rules) }
+        val out = DefenseOutcome(steps, detail)
+        val state = State(defense, rules, scratch)
+        val modules = defense.modules.map { State(it, rules, scratch) }
         if (plan == ShieldPlan.VENT_NOW) state.startVent()
 
         val held = ArrayList<Hit>()
@@ -103,13 +115,16 @@ class DefenseResolver(
             state.advance(DT * tm)
             out.flux[i] = state.flux
             out.hardFlux[i] = state.hardFlux
-            out.shieldUp[i] = state.shieldUpNow()
+            if (detail) out.shieldUp[i] = state.shieldUpNow()
             out.hullLost[i] = defense.hull - state.hull
-            out.moduleHullLost[i] = modules.sumOf { (it.def.hull - it.hull).toDouble() }.toFloat()
+            if (detail) {
+                var moduleLost = 0f
+                for (k in modules.indices) moduleLost += modules[k].def.hull - modules[k].hull
+                out.moduleHullLost[i] = moduleLost
+                out.shieldFlux[i] = state.shieldFluxTaken
+                out.potentialFlux[i] = state.potentialFlux
+            }
             out.armorLost[i] = state.armorLostMax
-            out.shieldFlux[i] = state.shieldFluxTaken
-            out.potentialFlux[i] = state.potentialFlux
-            out.potentialHardFlux[i] = state.potentialHardFlux
             if (state.overloadedAt >= 0f && out.overloadStart < 0f) {
                 out.overloadStart = state.overloadedAt
                 out.overloadDuration = state.overloadTotal / tm
@@ -121,6 +136,7 @@ class DefenseResolver(
                 for (h in release) applyHit(h, i, state, modules, held, out, forceUnheld = true)
             }
         }
+        out.potentialFluxEnd = state.potentialFlux
         return out
     }
 
@@ -140,11 +156,13 @@ class DefenseResolver(
         val shieldFlux = state.shieldFluxOf(hit)
         if (!hit.conservative) {
             state.potentialFlux += shieldFlux
-            if (!hit.softFlux) state.potentialHardFlux += shieldFlux
         }
 
         if (state.shieldCovers(bearing, 0f)) {
-            if (!forceUnheld) out.shieldHitTimes += hit.time
+            val times = out.shieldHitTimes
+            if (!forceUnheld && (times.size == 0 || times[times.size - 1] <= DefenseOutcome.SHIELD_HIT_HORIZON)) {
+                times += hit.time
+            }
             if (hit.conservative && !forceUnheld) {
                 held += hit
                 return
@@ -179,7 +197,7 @@ class DefenseResolver(
     }
 
     /** One ship's (or module's) mutable defences. */
-    private class State(val def: SimDefense, val rules: DamageRules) : FluxGate {
+    private class State(val def: SimDefense, val rules: DamageRules, scratch: Scratch?) : FluxGate {
         var flux = def.flux
         var hardFlux = def.hardFlux
         var hull = def.hull
@@ -197,9 +215,8 @@ class DefenseResolver(
         var time = 0f
         var shieldFluxTaken = 0f
         var potentialFlux = 0f
-        var potentialHardFlux = 0f
         var armorLostMax = 0f
-        val grid = def.armor?.let { ArmorGrid(it, rules) }
+        val grid = def.armor?.let { ArmorGrid(it, rules, scratch) }
 
         /** Shield held down for the whole resolution (venting from t = 0). */
         var ventHeld = false

@@ -5,9 +5,8 @@ import com.fs.starfarer.api.combat.MissileAPI
 import com.fs.starfarer.api.combat.ShieldAPI
 import com.fs.starfarer.api.combat.ShipAPI
 import com.fs.starfarer.api.combat.ShipwideAIFlags.AIFlags
-import org.lazywizard.lazylib.MathUtils
-import org.lazywizard.lazylib.combat.CombatUtils
 import org.starficz.combataitweaks.predictor.DamageOutlook
+import org.starficz.combataitweaks.runtime.CombatScan
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -84,27 +83,38 @@ class ShieldController(private val ship: ShipAPI) {
 
     /** See the class comment: a recent shield hit, an enemy beam over the ship, a shot or missile inbound. */
     private fun liveThreat(now: Float, window: Float): String? {
-        if (now - lastShieldHit < RECENT_HIT) return "shield hit %.1fs ago".format(now - lastShieldHit)
+        if (now - lastShieldHit < RECENT_HIT) {
+            return if (Explain.enabled) "shield hit %.1fs ago".format(now - lastShieldHit) else "shield hit"
+        }
         val engine = Global.getCombatEngine() ?: return null
+        // one pass over the battle per frame, shared by every CAT ship
+        val scan = CombatScan.of(engine)
         val r = ship.collisionRadius
+        val owner = ship.owner
         val sx = ship.location.x; val sy = ship.location.y
-        for (beam in engine.beams) {
+        val svx = ship.velocity.x; val svy = ship.velocity.y
+        for (k in scan.beams.indices) {
+            val beam = scan.beams[k]
             val source = beam.source ?: continue
-            if (source.owner == ship.owner) continue
+            if (source.owner == owner) continue
             if (beam.damageTarget === ship || passesNear(beam.from.x - sx, beam.from.y - sy, beam.to.x - sx,
-                    beam.to.y - sy, r + BEAM_PAD)) return "beam from ${source.hullSpec.hullId}"
+                    beam.to.y - sy, r + BEAM_PAD)) return if (Explain.enabled) "beam from ${source.hullSpec.hullId}" else "beam"
         }
         val range = MAX_SHOT_SPEED * window + r
-        for (p in CombatUtils.getProjectilesWithinRange(ship.location, range)) {
-            if (p.owner == ship.owner || p.didDamage() || p.isFading) continue
-            if (arrives(p.location.x - ship.location.x, p.location.y - ship.location.y,
-                    p.velocity.x - ship.velocity.x, p.velocity.y - ship.velocity.y, r, window)) return "shot inbound"
+        val range2 = range * range
+        val xs = scan.shotX; val ys = scan.shotY; val vxs = scan.shotVx; val vys = scan.shotVy; val owners = scan.shotOwner
+        for (k in 0 until scan.shotCount) {
+            if (owners[k] == owner) continue
+            val dx = xs[k] - sx; val dy = ys[k] - sy
+            if (dx * dx + dy * dy > range2) continue
+            if (arrives(dx, dy, vxs[k] - svx, vys[k] - svy, r, window)) return "shot inbound"
         }
-        for (m in CombatUtils.getMissilesWithinRange(ship.location, range)) {
-            if (m.owner == ship.owner || m.didDamage() || m.isFading || m.isFizzling) continue
+        for (k in 0 until scan.missileCount) {
+            if (scan.missileOwner[k] == owner) continue
             // guided missiles turn: any within reach of the window counts
-            val reach = max(m.velocity.length(), m.maxSpeed) * window + r + MISSILE_PAD
-            if (MathUtils.isWithinRange(m.location, ship.location, reach)) return "missile inbound"
+            val reach = scan.missileSpeed[k] * window + r + MISSILE_PAD
+            val dx = scan.missileX[k] - sx; val dy = scan.missileY[k] - sy
+            if (dx * dx + dy * dy <= reach * reach) return "missile inbound"
         }
         return null
     }

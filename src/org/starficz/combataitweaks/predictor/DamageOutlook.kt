@@ -44,6 +44,7 @@ class DamageOutlook(val startTime: Float, val result: DamageResult?) {
      */
     fun moveOption(
         name: String, kind: MoveKind, system: Boolean, currentTime: Float, maxFlux: Float, escape: Boolean = false,
+        standoff: Boolean = false,
     ): MoveOption? {
         val o = result?.normal ?: return null
         val from = currentTime - startTime
@@ -61,6 +62,7 @@ class DamageOutlook(val startTime: Float, val result: DamageResult?) {
             endHardFlux = o.hardFlux[end] / flux,
             escape = escape,
             trade = trade(from),
+            standoff = standoff,
         )
     }
 
@@ -71,7 +73,7 @@ class DamageOutlook(val startTime: Float, val result: DamageResult?) {
     fun nextShieldHit(currentTime: Float): Float? {
         val times = result?.normal?.shieldHitTimes ?: return null
         val from = currentTime - startTime
-        for (t in times) if (t >= from) return t - from
+        for (k in 0 until times.size) if (times[k] >= from) return times[k] - from
         return Float.MAX_VALUE
     }
 

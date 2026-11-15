@@ -123,6 +123,7 @@ private fun ShipAPI.toSimShip(): SimShip {
         moduleOffsetAngle = parent?.let { Misc.normalizeAngle(it.location.getAngle(location) - it.facing) } ?: 0f,
         moduleFacingOffset = parent?.let { Misc.normalizeAngle(facing - it.facing) } ?: 0f,
         backOff = backOffTraits(),
+        gunReach = Engagement.gunReach(weapons),
     )
 }
 

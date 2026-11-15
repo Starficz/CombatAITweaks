@@ -101,6 +101,8 @@ class TraceRecorder private constructor() {
             .bool("sys", s.system?.isActive == true)
         s.shipAI?.aiFlags?.let { flags ->
             VanillaTarget.of(s)?.let { l.str("mt", it.id) }
+            // the target of the maneuver vanilla's sequence switched to in the last second, if any
+            (flags.getCustom(AIFlags.MANEUVER_TARGET) as? ShipAPI)?.let { l.str("mft", it.id) }
             val override = runCatching { s.shipAI?.config?.personalityOverride }.getOrNull()
             l.str("pers", override ?: s.captain?.personalityAPI?.id)
             (flags.getCustom(AIFlags.MANEUVER_RANGE_FROM_TARGET) as? Float)?.let { l.num("mr", it, 0) }
@@ -109,6 +111,7 @@ class TraceRecorder private constructor() {
             l.str("st", s.customData[CombatAIv2.BEHAVIOR_STATE]?.toString())
             l.str("vt", s.customData[VentController.TRACE]?.toString())
             l.str("mv", s.customData[org.starficz.combataitweaks.decide.MoveController.TRACE]?.toString())
+            (s.customData[org.starficz.combataitweaks.decide.MoveController.TARGET] as? ShipAPI)?.let { l.str("ct", it.id) }
             if (s.customData[org.starficz.combataitweaks.decide.ShieldController.DROPPING] == true) l.bool("shd", true)
             // why the shield stays up while there is hard flux to drain (plan §13.9)
             if (s.shield?.isOn == true && ft.hardFlux > 0.1f * ft.maxFlux) {
@@ -256,8 +259,11 @@ class TraceRecorder private constructor() {
         sb.append(",\"hard\":"); sampled(sb, o.hardFlux, o.steps)
         sb.append(",\"hull\":"); sampled(sb, o.hullLost, o.steps)
         sb.append(",\"armor\":"); sampled(sb, o.armorLost, o.steps)
-        sb.append(",\"modules\":"); sampled(sb, o.moduleHullLost, o.steps)
-        sb.append(",\"shieldFlux\":"); sampled(sb, o.shieldFlux, o.steps)
+        // a lean outcome (the trace was switched on mid-batch) has no detail arrays
+        if (o.moduleHullLost.isNotEmpty()) {
+            sb.append(",\"modules\":"); sampled(sb, o.moduleHullLost, o.steps)
+            sb.append(",\"shieldFlux\":"); sampled(sb, o.shieldFlux, o.steps)
+        }
         sb.append(",\"overload\":").num(o.overloadStart).append(",\"overloadDur\":").num(o.overloadDuration)
         sb.append('}')
     }

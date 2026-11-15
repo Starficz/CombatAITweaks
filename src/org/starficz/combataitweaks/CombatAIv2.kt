@@ -6,12 +6,12 @@ import com.fs.starfarer.api.combat.listeners.AdvanceableListener
 import com.fs.starfarer.api.util.IntervalUtil
 import org.json.JSONObject
 import org.lazywizard.lazylib.MathUtils
-import org.lazywizard.lazylib.combat.AIUtils
 import org.starficz.combataitweaks.decide.MoveController
 import org.starficz.combataitweaks.decide.SystemProfiles
 import org.starficz.combataitweaks.decide.ShieldController
 import org.starficz.combataitweaks.decide.VentController
 import org.starficz.combataitweaks.predictor.PredictorManager
+import org.starficz.combataitweaks.runtime.CombatScan
 import org.starficz.combataitweaks.runtime.VanillaTarget
 
 data class CombatAIConfig(
@@ -141,7 +141,7 @@ class CombatAIv2(val ship: ShipAPI, val config: CombatAIConfig = CombatAIConfig(
         // the vent decision runs with or without enemies nearby: nothing threatening is the best time to vent
         ventController.execute(now, results[PredictorManager.HOLD]?.outlook, results[PredictorManager.BACK_OFF]?.outlook)
 
-        val enemiesNear = AIUtils.getNearbyEnemies(ship, NEARBY).any { !it.isFighter }
+        val enemiesNear = CombatScan.of(engine).anyEnemyNear(ship.owner, ship.location.x, ship.location.y, NEARBY)
         if (target == null || !enemiesNear) {
             if (!fallback) moveController.standDown()
             fallback = true
@@ -157,13 +157,18 @@ class CombatAIv2(val ship: ShipAPI, val config: CombatAIConfig = CombatAIConfig(
         ship.setCustomData(BEHAVIOR_STATE, choice?.state?.name ?: NO_PREDICTION)
     }
 
-    /** The ship CAT advances on and backs off from: vanilla's attack target, else the ship target, else the nearest. */
+    /**
+     * The ship CAT advances on and backs off from: vanilla's attack target, else the ship target, else the nearest,
+     * the first two only within [NEARBY]. Vanilla's first picker only looks within 2200 and its fallbacks go to the
+     * nearest ship of a size class anywhere on the map, so its target can be a ship far away while another is close.
+     */
     private fun pickTarget(): ShipAPI? {
-        fun ShipAPI.usable() = isAlive && !isHulk && !isFighter && owner != ship.owner && owner != 100
+        fun ShipAPI.usable() = isAlive && !isHulk && !isFighter && owner != ship.owner && owner != 100 &&
+            MathUtils.isWithinRange(this, ship, NEARBY)
         val vanilla = VanillaTarget.of(ship)
         if (vanilla != null && vanilla.usable()) return vanilla
         ship.shipTarget?.takeIf { it.usable() }?.let { return it }
-        return AIUtils.getNearbyEnemies(ship, NEARBY).filter { !it.isFighter }
-            .minByOrNull { MathUtils.getDistanceSquared(it.location, ship.location) }
+        val engine = Global.getCombatEngine() ?: return null
+        return CombatScan.of(engine).nearestEnemy(ship.owner, ship.location.x, ship.location.y, NEARBY)
     }
 }

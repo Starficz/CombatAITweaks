@@ -71,17 +71,24 @@ class FireControl(
     val target: SimDefense,
     private val targetOwner: Int,
     val targetTimeline: Timeline,
+    /** Where its hits come from; null: new ones (hits kept past the run). */
+    private val pool: Scratch? = null,
 ) {
     private val steps = targetTimeline.steps
 
     val hits = ArrayList<Hit>()
     val launched = ArrayList<InFlightMissile>()
 
-    /** Per step: the strongest and second-strongest shooter with guns on the target (DPS and bearing from it). */
-    val topDps = FloatArray(steps)
-    val topBearing = FloatArray(steps)
-    val secondDps = FloatArray(steps)
-    val secondBearing = FloatArray(steps)
+    /**
+     * Per step: the strongest and second-strongest shooter with guns on the target (DPS and bearing from it). Only
+     * [omniFacing] reads them, so they exist only for omni shields, and only once something has guns on it (most
+     * targets in reach never get shot at in a branch; these were most of a batch's garbage).
+     */
+    private val tracksThreats = target.shield == ShieldKind.OMNI
+    private var topDps = EMPTY
+    private var topBearing = EMPTY
+    private var secondDps = EMPTY
+    private var secondBearing = EMPTY
 
     /** DPS a [Gunnery] has on this target in the step it is running, flushed into the ranking at the step's end. */
     internal var pendingDps = 0f
@@ -89,7 +96,10 @@ class FireControl(
 
     private val self: (Int) -> FireControl? = { this }
 
-    /** Flux each shooter fired by [fire] spent per step, by shooter id (its own flux, for its defences). */
+    /**
+     * Flux each shooter fired by [fire] spent per step, by shooter id (its own flux, for its defences); only for
+     * shooters fired with `recordFlux`.
+     */
     val firingFlux = HashMap<String, FloatArray>()
 
     /**
@@ -114,7 +124,7 @@ class FireControl(
             if (sys.arc < 360f && abs(shortestRotation(timeline.facing[i] + sys.angle, angleOf(dx, dy))) > sys.arc / 2f) continue
             val instant = sys.speed >= 10000f
             val travel = if (instant) 0f else max(0f, dist - target.hitRadius) / max(sys.speed, 1f)
-            hits += Hit(
+            hits += pool.hit(
                 time = time + travel, damage = sys.damage * vsSize, hitStrength = sys.damage * vsSize,
                 emp = sys.emp * vsSize, kind = sys.kind,
                 delivery = if (instant) Delivery.PROJECTILE else Delivery.MISSILE,
@@ -133,14 +143,14 @@ class FireControl(
      */
     fun fire(
         shooter: SimShooter, timeline: Timeline, quiet: Reaction? = null, discipline: FireDiscipline? = null,
-        pressure: FloatArray? = null,
+        pressure: FloatArray? = null, recordFlux: Boolean = true,
     ) {
         if (shooter.owner == targetOwner || shooter.shipId == target.shipId || shooter.weapons.isEmpty()) return
         val maxRange = shooter.weapons.maxOf { it.range } + target.hitRadius + 150f
         if (!ever(timeline) { d2 -> d2 <= maxRange * maxRange }) return
 
         val gunnery = Gunnery(shooter, timeline)
-        val spent = FloatArray(steps)
+        val spent = if (recordFlux) floats() else null
         val gate = ShooterFlux(shooter, quiet, pressure, spent)
         val enabled = if (discipline != null) BooleanArray(shooter.weapons.size) { true } else null
         for (i in 0 until steps) {
@@ -150,7 +160,7 @@ class FireControl(
             }
             gunnery.step(i, gate, self, enabled)
         }
-        firingFlux[shooter.shipId] = spent
+        if (spent != null) firingFlux[shooter.shipId] = spent
     }
 
     /** Beams deal their damage in 0.1 s ticks (engine time). */
@@ -165,7 +175,7 @@ class FireControl(
         if (!onTarget) return
         val perSecond = shooter.timeMult * vsSize
         val travel = if (w.speed > 0f) dist / w.speed else 0f
-        hits += Hit(
+        hits += pool.hit(
             time = time + travel,
             damage = w.damage * perSecond * tick,
             hitStrength = w.damage * vsSize,
@@ -199,7 +209,7 @@ class FireControl(
             if (spreadRadius <= target.hitRadius) 1f else (target.hitRadius / spreadRadius).coerceIn(0f, 1f)
         } else 1f
         val travel = if (w.speed > 0f) dist / w.speed else 0f
-        hits += Hit(
+        hits += pool.hit(
             time = time + travel,
             damage = w.damage * vsSize * chance,
             hitStrength = w.damage * vsSize,
@@ -217,6 +227,10 @@ class FireControl(
     }
 
     private fun rankThreat(i: Int, dps: Float, bearing: Float) {
+        if (!tracksThreats) return
+        if (topDps.isEmpty()) {
+            topDps = floats(); topBearing = floats(); secondDps = floats(); secondBearing = floats()
+        }
         if (dps > topDps[i]) {
             secondDps[i] = topDps[i]; secondBearing[i] = topBearing[i]
             topDps[i] = dps; topBearing[i] = bearing
@@ -229,15 +243,23 @@ class FireControl(
      * Where an omni shield points per step, following vanilla's omni shield AI (translated): at the top threat,
      * pulled toward the second one by half the angle between them, at most 0.3 x (arc - 10). NaN when nothing shoots.
      */
-    fun omniFacing(arc: Float): FloatArray = FloatArray(steps) { i ->
-        if (topDps[i] <= 0f) Float.NaN
-        else if (secondDps[i] <= 0f) topBearing[i]
-        else {
-            val diff = shortestRotation(topBearing[i], secondBearing[i])
-            val pull = min((arc - 10f) * 0.6f, abs(diff)) * 0.5f
-            normalizeAngle(topBearing[i] + pull * if (diff >= 0f) 1f else -1f)
+    fun omniFacing(arc: Float): FloatArray {
+        if (topDps.isEmpty()) return noFacing(steps)
+        val out = floats()
+        for (i in 0 until steps) out[i] = when {
+            topDps[i] <= 0f -> Float.NaN
+            secondDps[i] <= 0f -> topBearing[i]
+            else -> {
+                val diff = shortestRotation(topBearing[i], secondBearing[i])
+                val pull = min((arc - 10f) * 0.6f, abs(diff)) * 0.5f
+                normalizeAngle(topBearing[i] + pull * if (diff >= 0f) 1f else -1f)
+            }
         }
+        return out
     }
+
+    /** A zeroed per-step array: from the scratch when there is one (valid for this run only). */
+    private fun floats(): FloatArray = pool?.floats(steps) ?: FloatArray(steps)
 
     private inline fun ever(timeline: Timeline, test: (Float) -> Boolean): Boolean {
         for (i in 0 until steps) {
@@ -250,6 +272,7 @@ class FireControl(
 
     companion object {
         const val BEAM_TICK = 0.1f
+        private val EMPTY = FloatArray(0)
 
         /** Velocity at frame [i] from the timeline's positions. */
         fun velocityX(timeline: Timeline, i: Int): Float = velocity(timeline.x, timeline.steps, i)
@@ -420,7 +443,7 @@ class Gunnery(private val shooter: SimShooter, private val timeline: Timeline) {
                 }
             }
         }
-        for (s in touched) s.flushDps(i)
+        for (k in touched.indices) touched[k].flushDps(i)
         touched.clear()
     }
 

@@ -108,6 +108,11 @@ object Engagement {
         return min(primaryRange, gunRange)
     }
 
+    /** Longest range of a non-missile weapon that can fire at ships; [weaponReach] when it has only missiles. */
+    fun gunReach(weapons: List<WeaponInfo>): Float =
+        weapons.filter { it.usable && !it.pdOnly && it.kind != WeaponKind.MISSILE }.maxOfOrNull { it.range }
+            ?: weaponReach(weapons)
+
     /** Longest range of any weapon that can fire at ships. */
     fun weaponReach(weapons: List<WeaponInfo>): Float =
         weapons.filter { it.usable && !it.pdOnly }.maxOfOrNull { it.range } ?: 0f

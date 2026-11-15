@@ -74,8 +74,8 @@ private fun shooter(
 ) = SimShooter(id, 1, flux, 0f, maxFlux, dissipation, 1f, silence, FloatArray(6) { 1f }, weapons.toList())
 
 /** Fires one shooter sitting at (x, 0) facing the protected ship at the origin, for [steps] steps. */
-private fun fireAt(s: SimShooter, x: Float = 600f, steps: Int = 400): FireControl {
-    val fc = FireControl(defense(), 0, still(steps))
+private fun fireAt(s: SimShooter, x: Float = 600f, steps: Int = 400, def: SimDefense = defense()): FireControl {
+    val fc = FireControl(def, 0, still(steps))
     fc.fire(s, still(steps, x = x, facing = 180f))
     return fc
 }
@@ -143,6 +143,71 @@ internal fun damage() {
     tradeRule()
     reactions()
     shieldFlicker()
+    standoffTrade()
+    leanRuns()
+}
+
+/**
+ * A lean run (scratch hits and arrays, no detail arrays) predicts exactly what a full one does, also on a reused
+ * scratch: front and omni shields (the threat ranking and facing), beams, guns and missiles.
+ */
+private fun leanRuns() {
+    for (kind in listOf(ShieldKind.FRONT, ShieldKind.OMNI)) {
+        val tag = kind.name.lowercase()
+        val p = ship("P", owner = 0, maxSpeed = 0f, accel = 0f, decel = 0f, turnAccel = 0f, maxTurn = 0f)
+        val e = ship("E", owner = 1, x = 600f, facing = 180f, maxSpeed = 0f, accel = 0f, decel = 0f, engagement = 500f,
+            reach = 800f)
+        val branch = World(listOf(p, e), SimParams(200)).branch("P", OwnPlan.Hold())
+        val pShooter = SimShooter("P", 0, 0f, 0f, 1000f, 100f, 1f, 0f, FloatArray(6) { 1f },
+            listOf(gun(range = 800f, arc = 60f, fluxCost = 30f),
+                gun(mode = FireMode.GUIDED_MISSILE, missile = missileInfo(), ammo = 3, noAim = true)))
+        val inputs = DamageInputs(listOf(shooter(gun(damage = 150f, range = 800f, arc = 60f, mode = FireMode.BEAM),
+            gun(range = 800f, arc = 60f, cooldown = 0.5f),
+            gun(mode = FireMode.GUIDED_MISSILE, missile = missileInfo(), ammo = 3, noAim = true)), pShooter),
+            emptyList(), emptyList(),
+            mapOf("P" to defense(maxFlux = 3000f, shield = kind), "E" to defense(id = "E", owner = 1, shield = kind)))
+        val own = OwnFire("E", true)
+        val full = DamageSim.run("P", 0, branch.timelines, inputs, withVent = true, own = own)!!
+        val pool = Scratch()
+        val lean = DamageSim.run("P", 0, branch.timelines, inputs, withVent = true, own = own, pool = pool)!!
+        pool.reset()
+        val reused = DamageSim.run("P", 0, branch.timelines, inputs, withVent = true, own = own, pool = pool)!!
+        fun same(a: DefenseOutcome, b: DefenseOutcome) = a.flux.contentEquals(b.flux) && a.hardFlux.contentEquals(b.hardFlux) &&
+            a.hullLost.contentEquals(b.hullLost) && a.armorLost.contentEquals(b.armorLost) && a.overloadStart == b.overloadStart
+        check(full.hits.size > 50 && lean.hits.isEmpty(), "lean $tag: a lean run keeps no hits") { "${full.hits.size} ${lean.hits.size}" }
+        check(full.dealt!!.isNotEmpty() && full.dealt!![0].outcome.armorLost[199] + full.dealt!![0].outcome.flux[199] > 0f,
+            "lean $tag: the ship's fire lands (the case tests something)")
+        for ((name, r) in listOf("lean" to lean, "reused scratch" to reused)) {
+            check(same(full.normal, r.normal) && same(full.ventNow!!, r.ventNow!!), "lean $tag: $name predicts the same as a full run")
+            check(full.dealt!!.size == r.dealt!!.size && full.dealt!!.indices.all { same(full.dealt!![it].outcome, r.dealt!![it].outcome) },
+                "lean $tag: $name deals the same")
+            check(full.normal.shieldHitTimes.toList().take(5) == r.normal.shieldHitTimes.toList().take(5),
+                "lean $tag: $name has the same shield hit times")
+        }
+        near(lean.normal.potentialFluxEnd, full.normal.potentialFlux[199], 1e-3f, "lean $tag: the end potential flux is kept")
+        check(lean.normal.shieldUp.isEmpty() && full.normal.shieldUp.size == 200, "lean $tag: no detail arrays")
+    }
+}
+
+/** Plan §13.6: P outranging a slow enemy holds at standoff, deals damage and takes none. */
+private fun standoffTrade() {
+    val p = ship("P", owner = 0, engagement = 900f, reach = 900f, maxSpeed = 200f, accel = 200f, decel = 200f)
+    val e = ship("E", owner = 1, x = 1200f, facing = 180f, reach = 500f, engagement = 500f, maxSpeed = 100f, accel = 100f,
+        decel = 100f)
+    val branch = World(listOf(p, e), SimParams(200)).branch("P", OwnPlan.Standoff("E"))
+    check("E" in branch.committed, "standoff trade: the enemy commits")
+    val pShooter = SimShooter("P", 0, 0f, 0f, 1000f, 100f, 1f, 0f, FloatArray(6) { 1f },
+        listOf(gun(range = 900f, arc = 60f, cooldown = 0.5f)))
+    val inputs = DamageInputs(listOf(shooter(gun(range = 500f, arc = 60f, cooldown = 0.5f)), pShooter),
+        emptyList(), emptyList(), mapOf("P" to defense(shieldOn = false, shield = ShieldKind.NONE),
+            "E" to defense(id = "E", owner = 1, shieldOn = false, shield = ShieldKind.NONE)))
+    val r = DamageSim.run("P", 0, branch.timelines, inputs, withVent = false, own = OwnFire("E", true))
+    val end = 199
+    check(r != null && r.normal.hullLost[end] == 0f && r.normal.armorLost[end] == 0f,
+        "standoff trade: out of reach, the ship takes nothing") { "hull ${r?.normal?.hullLost?.get(end)} armor ${r?.normal?.armorLost?.get(end)}" }
+    val dealt = r?.dealt?.firstOrNull()?.outcome
+    check(dealt != null && dealt.armorLost[end] + dealt.hullLost[end] > 0f,
+        "standoff trade: and deals damage (kiting)") { "${dealt?.armorLost?.get(end)} ${dealt?.hullLost?.get(end)}" }
 }
 
 /** Shield flicker (plan §13.9): the shield-covered hit times, and the drop rule. */
@@ -153,8 +218,8 @@ private fun shieldFlicker() {
         hit(2f, 100f, DamageKind.KINETIC, fromX = -500f),
         hit(3f, 100f, DamageKind.KINETIC, conservative = true),
     ))
-    check(o.shieldHitTimes == listOf(1f, 3f), "flicker: covered hits recorded, held conservative ones too, rear not") {
-        "${o.shieldHitTimes}"
+    check(o.shieldHitTimes.toList() == listOf(1f, 3f), "flicker: covered hits recorded, held conservative ones too, rear not") {
+        "${o.shieldHitTimes.toList()}"
     }
 
     // a ship with plenty to drain: 1000 flux, 400 of it hard, dissipation 300, upkeep 150
@@ -566,7 +631,7 @@ private fun fireControl() {
     check(turned.hits.first().time > 1.4f, "fire: turrets turn onto the target first") { "${turned.hits.first().time}" }
 
     // threat ranking for omni shields
-    val omni = fireAt(shooter(gun()))
+    val omni = fireAt(shooter(gun()), def = defense(shield = ShieldKind.OMNI))
     near(omni.omniFacing(120f)[10], 0f, 0.01f, "fire: an omni shield faces the only shooter")
 
     // guided missiles launch into the missile simulation
@@ -583,7 +648,11 @@ private fun missiles() {
     ms.run(listOf(missile(1000f)))
     check(ms.hits.size == 1, "missile: a guided missile hits a still target")
     near(ms.hits.first().time, 1.95f, 0.3f, "missile: arrival time from speed and acceleration")
-    check(!ms.missileBearing[5].isNaN() || !ms.missileBearing[30].isNaN(), "missile: incoming missiles are tracked")
+    // the nearest-missile bearing feeds the omni shield facing, so only omni shields track it
+    val omni = MissileSim(defense(shield = ShieldKind.OMNI), 0, still(400))
+    omni.run(listOf(missile(1000f)))
+    check(!omni.missileBearing[5].isNaN() || !omni.missileBearing[30].isNaN(), "missile: incoming missiles are tracked (omni shields)")
+    check(ms.missileBearing.isEmpty(), "missile: not tracked for a front shield (nothing reads it)")
 
     // a moving target: lead pursuit still connects
     val moving = Timeline(400).apply { for (i in 0 until 400) { x[i] = 0f; y[i] = (i + 1) * DT * 150f; facing[i] = 90f } }

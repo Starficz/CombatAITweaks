@@ -16,10 +16,11 @@ import kotlin.math.min
  *    and 1/30 to each of the outer 12. What a cell can't absorb (and anything landing off the grid) goes to hull
  *    x type hull mult / m x hullDamageTakenMult.
  */
-class ArmorGrid(val info: ArmorInfo, private val rules: DamageRules) {
+class ArmorGrid(val info: ArmorInfo, private val rules: DamageRules, scratch: Scratch? = null) {
     val width = info.width
     val height = info.height
-    val cells: FloatArray = info.cells.copyOf()
+    /** A copy of the captured cells (from [scratch] when given: valid for that run only). */
+    val cells: FloatArray = scratch?.floats(info.cells.size)?.also { info.cells.copyInto(it) } ?: info.cells.copyOf()
 
     /** Damage taken by the last [hit], in armor-grid points (before the hull overflow). */
     var lastArmorDamage = 0f

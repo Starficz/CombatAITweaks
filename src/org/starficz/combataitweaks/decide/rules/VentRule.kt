@@ -65,7 +65,8 @@ object VentRule {
     fun decide(i: VentInputs): VentChoice {
         if (i.blockedBy != null) return VentChoice(false, false, null, "no vent: ${i.blockedBy}")
         if (i.fluxLevel <= i.minVentLevel) {
-            return VentChoice(false, false, null, "no vent: flux %.2f <= %.2f".format(i.fluxLevel, i.minVentLevel))
+            return VentChoice(false, false, null, if (!Explain.enabled) "no vent: low flux"
+                else "no vent: flux %.2f <= %.2f".format(i.fluxLevel, i.minVentLevel))
         }
         if (i.options.isEmpty()) return VentChoice(false, false, null, "no vent: no prediction")
 
@@ -75,7 +76,7 @@ object VentRule {
         val lowHull = i.hullLevel < i.stopVentingBelowHullLevel
         val hullLimit = if (lowHull) HULL_EPSILON else i.maxHull * i.maxHullDamageLevelToVent
 
-        val numbers = "W %.1fs, vent %s armor %.0f/%.0f hull %.0f/%.0f, stay %s cost %.0f%s".format(
+        val numbers = if (!Explain.enabled) "-" else "W %.1fs, vent %s armor %.0f/%.0f hull %.0f/%.0f, stay %s cost %.0f%s".format(
             i.window, bestVent.name, bestVent.ventArmor, armorLimit, bestVent.ventHull, hullLimit,
             bestStay.name, bestStay.stayCost,
             if (bestStay.stayOverloadsIn >= 0f) ", stay overloads in %.1fs".format(bestStay.stayOverloadsIn) else "")

@@ -8,6 +8,30 @@ import kotlin.math.sqrt
 // no API objects. The unit tests compile this package with only the Kotlin stdlib, which enforces that.
 
 internal const val DEG_TO_RAD = (PI / 180.0).toFloat()
+
+private val noFacings = java.util.concurrent.ConcurrentHashMap<Int, FloatArray>()
+
+/**
+ * An omni facing of all NaN ("keep its current offset") for [steps] steps, shared: read-only by convention (the
+ * defence resolver only reads it).
+ */
+fun noFacing(steps: Int): FloatArray = noFacings.getOrPut(steps) { FloatArray(steps) { Float.NaN } }
+
+/** A growable list of floats without boxing (hot paths of a batch). */
+class FloatList(capacity: Int = 16) {
+    private var data = FloatArray(capacity)
+    var size = 0
+        private set
+
+    operator fun get(i: Int): Float = data[i]
+
+    operator fun plusAssign(v: Float) {
+        if (size == data.size) data = data.copyOf(maxOf(16, size * 2))
+        data[size++] = v
+    }
+
+    fun toList(): List<Float> = List(size) { data[it] }
+}
 internal const val RAD_TO_DEG = (180.0 / PI).toFloat()
 
 /** Angle in [0, 360). */

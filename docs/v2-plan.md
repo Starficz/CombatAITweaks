@@ -444,11 +444,21 @@ option is a system variant). Otherwise block vanilla's use only where v1 did (`e
 | State | Flags (each set for 0.1 s and refreshed) |
 |---|---|
 | `ADVANCE` | `DO_NOT_BACK_OFF`, `BACK_OFF_MAX_RANGE` = P's engagement range (the lever that actually brings it closer), and `HARASS_MOVE_IN` (only matters for cautious or timid officers and harass orders) |
-| `HOLD` | `DO_NOT_BACK_OFF`, and `BACK_OFF_MIN_RANGE` = `BACK_OFF_MAX_RANGE` = the distance when it started holding (otherwise vanilla presses in) |
+| `HOLD` | the standoff (§13.4): `BACK_OFF_MIN_RANGE` = `BACK_OFF_MAX_RANGE` = the standoff range + 100, without `DO_NOT_BACK_OFF` (so vanilla backs up as enemies close). Without a standoff prediction: `DO_NOT_BACK_OFF` and both ranges = the distance when it started holding (otherwise vanilla presses in) |
 | `BACK_OFF` | `BACK_OFF`, `DO_NOT_PURSUE` |
 | `DISENGAGE` | `BACK_OFF`, `DO_NOT_PURSUE`, `BACK_OFF_MIN_RANGE` = the distance where no enemy commits |
 | `VENTING` | if safe, `DO_NOT_BACK_OFF` + `DO_NOT_BACK_OFF_EVEN_WHILE_VENTING`, else `BACK_OFF` |
 | every state except an ordered vent | `DO_NOT_VENT`, which switches off vanilla's own vent logic (`v1-audit.md` §1, Venting) |
+
+**Target and range, handed over directly** (added 2026-11-14, `runtime/VanillaManeuver`). For `ADVANCE` and `HOLD`
+CAT gives vanilla's AI the maneuver itself: `StrafeTargetManeuverV2(ship, target, false, 0, range, flockingAI, ai,
+true)` through the public `BasicShipAI.setManeuver`, as `pickManeuver` builds it (translation of obfuscated code; the
+constructor is found by shape, the range is surface to surface). It is handed over again as soon as the AI's
+`sequence` runs anything else. The target override alone wasn't enough: `pickManeuver` ignores it when an order's
+response brings its own maneuver. CAT's target is vanilla's target or the ship target only within 3000; otherwise
+the nearest enemy ship. Vanilla's own pick can be a ship across the map: its first picker looks within 2200 only.
+In `movecases` the advance check was flaky for that reason (vanilla's target was the parked enemy 12.7 km away
+while the Lasher sat at 2200); it now closes to 640–810 of a 597 approach range.
 
 **Automated ships** (the player's AI-core ships too) ignore `BACK_OFF` unless venting
 (`backingOffWhileNotVentingAllowed = false`), so `BACK_OFF` and `DISENGAGE` need direct movement for them from
@@ -509,6 +519,26 @@ run's results, so a bad decision can be read back afterwards instead of guessed 
     battle (2 × 250 FP per side) must keep capture under 1 ms per frame on average.
 - **Results** are tagged with the snapshot time. Decisions use the newest; anything older than 0.5 s counts as
   missing, and the ship falls back to vanilla.
+- **Garbage** (added 2026-11-14). The user's game runs Shenandoah (concurrent, `compact`, 10 ms pause target, 2 GB
+  heap): allocation rate costs GC threads and allocation pacing that slows every allocating thread, the main thread
+  too. CAT made 55–58% of combat-time allocation (~35 MB/s in a 60 FP `aibattle`), 93% of it on the workers.
+  - **Lean runs** when the trace is off (`TraceRecorder.enabled()`, checked per batch): `DamageSim.run(pool =
+    Scratch.local())` takes every `Hit` and every run-only float array (omni threat ranking, firing flux, missile
+    tracking, armor grid copies, omni facings) from a per-thread `Scratch`, reset at the start of each branch and
+    before a reaction re-run. Nothing suspends inside a branch, so a branch stays on one thread. Lean results keep no
+    hits and no detail arrays (`shieldUp`, `moduleHullLost`, `shieldFlux`, `potentialFlux`; `potentialFluxEnd` stays
+    for the overlay). A unit test checks lean and reused-scratch runs predict bit for bit what a full run does.
+  - Always: threat ranking only for omni shields that something has guns on; firing flux kept only for the ship's
+    own targets; fire discipline sorts each weapon list once; shield hit times unboxed (`FloatList`) and kept only
+    up to the first after 3 s; one shared all-NaN facing array.
+  - Per predicted branch, 86 KB before and 36–40 KB after (two battles); combat-time CAT allocation 15–19 MB/s
+    against ~35. What is left is mostly what the results keep (timelines and outcomes); reusing those across batches
+    is the next lever.
+- **Main thread** (same date). About 5% of main-thread samples in `aibattle`. `runtime/CombatScan` walks the
+  projectiles, missiles, beams and ships once per frame for every CAT ship (the shield live check, the target pick,
+  the ally and threat centres; ship DPS cached for 1 s), which cut the shield check from 1.1% to 0.3–0.5%. The rules
+  only format their reasons with numbers while the trace is on (`decide/Explain`). The biggest piece left is the
+  batch snapshot (`PredictorManager.advance`, 1–2%).
 - **Overlay** (dev mode):
   - P's options, coloured by cost;
   - each committed enemy's pursuit path and hold circle;
@@ -793,6 +823,27 @@ decision only.
 - The flags: `BACK_OFF_MIN_RANGE` = `BACK_OFF_MAX_RANGE` = that standoff distance from P's maneuver target.
   **(verify)** in the movement scenarios that vanilla holds it.
 
+As built (2026-11-14):
+- **Branch** `STANDOFF` (`OwnPlan.Standoff`) replaces `HOLD~`; plain `HOLD` (keep still) stays for the vent. P flies
+  the pursuit mover with a hold range re-set every step: on the line from its target through P, the target's
+  standoff (its longest non-missile gun + both radii + 100) or P's own engagement range if farther, pushed out past
+  every other hostile non-fighter's standoff (committed ones where they are in the branch, the rest on base paths).
+  When no point on the line is clear within 1000 more (a hostile behind P) it keeps the target's range and the sim
+  shows the cost. Missiles don't count toward reach: their ammo runs out, and a standoff beyond them never engages.
+- **Rule:** the `HOLD` state is judged by `STANDOFF` alone (its own safety and flux). **Kiting:** while the standoff
+  deals damage and takes none, `ADVANCE` must also take more there and beat its trade (more net damage share, or
+  more net flux share at no worse damage). Otherwise identical trades (nothing reaches either) went to the standoff
+  and the unarmed-Lasher advance check fell to 61%.
+- **Flying it:** CAT hands vanilla the strafe at standoff + 100 and sets the range flags to that, without
+  `DO_NOT_BACK_OFF`. Translation of obfuscated code (`StrafeTargetManeuverV2`): the strafe closes beyond its range
+  + 20 and backs up only inside its range - 100, and not at all under `DO_NOT_BACK_OFF`. The + 100 makes it start
+  backing up at the standoff; it never sits closer than the sim has it.
+- **Checked:** unit tests for the path (outranging, outranged, gun reach not missile reach, push-out past a second
+  hostile, a faster enemy catches it) and the kiting rule. `movecases` gained a standoff phase: the Brawler
+  (Arbalests, 700) against an Enforcer with five chainguns (450): HOLD 64–71% and ADVANCE the rest (the Brawler's
+  own range also clears the chainguns), closest 739–766 against a reach of 555, no damage taken, 1080–1793 armor
+  dealt. Against the Dominator in the threat phase it now holds at the standoff about half the time, no hull lost.
+
 ### 13.5 Branches and cost
 
 Per CAT ship:
@@ -852,7 +903,8 @@ Later: fleet coordination (who engages whom, covering each other), §11a's coupl
 - **Trade:** `DamageOutlook` turns it into a `Trade` (shares) for `HOLD` and `ADVANCE` (`OptionRequest.trade`).
   `MoveRule.favourable` gates `ADVANCE`: taking nothing is free, or more damage share dealt than taken, or at least
   as much flux share dealt as taken. The reason line shows `trade d dealt/taken f dealt/taken`.
-- **Not built yet:** §13.4 standoff `HOLD` and the trade scenarios of §13.6.
+- **Not built yet:** §13.4 standoff `HOLD` and the trade scenarios of §13.6. (Since built: the standoff, its unit
+  tests and the "outranging a slow enemy" scenario; the other three §13.6 scenarios are still open.)
 
 Results (`aibattle`, laptop, another game running alongside):
 
@@ -1015,3 +1067,17 @@ predicted hit within the window.
 - **DEM stats API.** The audit found no DEM-specific stat getter in this build; confirm which addition was
   meant.
 - **Settings.** LunaLib for `H` and the debug overlay, vs the per-variant dialog.
+
+## 14. Later investigations
+
+Noted 2026-11-14 at the user's request; not planned yet.
+
+- **Armor tanking.** Sometimes it is worth dropping the shield in a fight, not only between hits (§13.9): against
+  mostly kinetic weapons (half damage on armor), with good armor, or when holding the shield up leaves no flux to fire
+  back, or a mix of these. How to judge it isn't worked out. A likely shape: a shield-down branch (or a shield plan
+  per branch) resolved like the others, then compared on the trade (§13.3): armor and hull lost against the flux
+  freed for the ship's own fire.
+- **Point defense** (§11a). The sim leaves out P's PD shooting missiles, fighters and DEMs down, so missile-heavy
+  enemies are over-predicted (DEM payloads about 2×). Modelling it properly means modelling PD accuracy, which is
+  hard. Start with a simple correction heuristic (an expected interception share per missile from P's PD DPS in
+  range and the missile's HP), and judge from the trace whether more is worth it.
