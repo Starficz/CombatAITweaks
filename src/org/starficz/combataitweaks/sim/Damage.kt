@@ -51,9 +51,34 @@ class DamageResult(
     fun withVentNow(ventNow: DefenseOutcome?) = DamageResult(hits, normal, ventNow, omniFacing, defense, dealt)
 }
 
+/** One option's branch as the decisions read it: the final paths, the damage, and how enemies reacted. */
+class PredictedBranch(val branch: BranchResult, val damage: DamageResult?, val coupling: Coupling)
+
 object DamageSim {
     /** An enemy counts as a target when it comes this much closer than the ship's longest weapon range + its radius. */
     private const val REACH_PAD = 150f
+
+    /**
+     * One option's damage on its [branch] (plan §13.8): run once; when the ship's fire makes committed enemies back
+     * off or overload, or its side presses their flux, the branch runs again with those reactions (re-simulated if
+     * anyone moves differently). The vent-now outcome stays the first run's: the ship doesn't fire while venting.
+     * [scratch]: a lean run's per-thread scratch, reset before each run here (the first run's hits are done with by
+     * the second).
+     */
+    fun branch(
+        world: World, shipId: String, plan: OwnPlan, branch: BranchResult, inputs: DamageInputs, withVent: Boolean,
+        own: OwnFire, scratch: Scratch? = null,
+    ): PredictedBranch {
+        val owner = world.byId[shipId]?.owner ?: return PredictedBranch(branch, null, Coupling.NONE)
+        var damage = run(shipId, owner, branch.timelines, inputs, withVent, own, pool = scratch?.also { it.reset() })
+            ?: return PredictedBranch(branch, null, Coupling.NONE)
+        val coupling = Reactions.find(world, shipId, branch.committed.keys, damage)
+        if (coupling.isEmpty()) return PredictedBranch(branch, damage, coupling)
+        val final = if (coupling.reactions.isEmpty()) branch else world.branch(shipId, plan, coupling.reactions)
+        val again = run(shipId, owner, final.timelines, inputs, false, own, coupling, scratch?.also { it.reset() })
+        if (again != null) damage = again.withVentNow(damage.ventNow)
+        return PredictedBranch(final, damage, coupling)
+    }
 
     /**
      * Fires everything hostile at [protectedId] along one branch's [timelines] and resolves the hits against its

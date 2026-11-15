@@ -145,6 +145,92 @@ internal fun damage() {
     shieldFlicker()
     standoffTrade()
     leanRuns()
+    tradeScenarios()
+}
+
+/** One side of a trade scenario: motion, guns and defences. */
+private class Side(val ship: SimShip, val shooter: SimShooter, val defense: SimDefense)
+
+private fun side(
+    id: String, owner: Int, x: Float, hull: Float, maxFlux: Float, dissipation: Float, guns: Int, gunDamage: Float,
+) = Side(
+    ship("id".replace("id", id), owner = owner, x = x, facing = if (owner == 0) 0f else 180f, reach = 700f,
+        engagement = 700f),
+    SimShooter(id, owner, 0f, 0f, maxFlux, dissipation, 1f, 0f, FloatArray(6) { 1f },
+        List(guns) { gun(damage = gunDamage, range = 700f, arc = 90f, cooldown = 0.5f, fluxCost = gunDamage) }),
+    defense(id = id, owner = owner, maxFlux = maxFlux, dissipation = dissipation, hull = hull),
+)
+
+/**
+ * The movement decision for P against one enemy E, through the real prediction path: the options MoveController
+ * asks for, each branch's damage with reactions ([DamageSim.branch]), read through [DamageOutlook] as the decisions
+ * read it, decided by [MoveRule] with the default config's limits.
+ */
+private fun decideAgainst(p: Side, e: Side): Pair<org.starficz.combataitweaks.decide.MoveChoice, List<org.starficz.combataitweaks.decide.MoveOption>> {
+    val world = World(listOf(p.ship, e.ship), SimParams(200))
+    val inputs = DamageInputs(listOf(p.shooter, e.shooter), emptyList(), emptyList(),
+        mapOf(p.ship.id to p.defense, e.ship.id to e.defense))
+    val away = OwnPlan.Thrust(p.ship.x - e.ship.x, p.ship.y - e.ship.y)
+    val requests = listOf(
+        Triple("HOLD", OwnPlan.Hold() as OwnPlan, true),
+        Triple("STANDOFF", OwnPlan.Standoff(e.ship.id), false),
+        Triple("BACK_OFF", OwnPlan.BackAway(e.ship.id), true),
+        Triple("ADVANCE~", OwnPlan.Then(OwnPlan.Approach(e.ship.id), 0.7f, away), false),
+        Triple("ADVANCE", OwnPlan.Approach(e.ship.id), false),
+    )
+    val own = OwnFire(e.ship.id, true)
+    val options = requests.mapNotNull { (name, plan, vent) ->
+        val predicted = DamageSim.branch(world, p.ship.id, plan, world.branch(p.ship.id, plan), inputs, vent, own)
+        val kind = when {
+            name.startsWith("ADVANCE") -> org.starficz.combataitweaks.decide.MoveKind.ADVANCE
+            name.startsWith("BACK_OFF") -> org.starficz.combataitweaks.decide.MoveKind.BACK_OFF
+            else -> org.starficz.combataitweaks.decide.MoveKind.HOLD
+        }
+        org.starficz.combataitweaks.predictor.DamageOutlook(0f, predicted.damage)
+            .moveOption(name, kind, false, 0f, p.defense.maxFlux, name.contains("~"), standoff = name == "STANDOFF")
+    }
+    return MoveRule.decide(org.starficz.combataitweaks.decide.MoveInputs(
+        options = options, venting = false, ventOption = null, fluxLevel = 0f,
+        hullLimit = p.defense.maxHull * 0.05f, previous = null, advanceGap = 0f,
+        forceAdvanceIfFluxBelowLevel = 0.7f, backoffIfFluxAboveLevel = 0.85f, backoffIfHardfluxAboveLevel = 0.75f,
+        reengageIfFluxDropsBelowLevel = 0.4f, maxFluxLevelRaiseToHarass = 0.3f,
+    )) to options
+}
+
+/**
+ * Plan §13.6, the trade scenarios: P (2000 hull, 3000 flux, 150 dissipation, two 200 DPS guns) 1300 from one enemy,
+ * both front shields, both guns 700:
+ * - a weaker enemy (half of everything) -> ADVANCE;
+ * - a stronger one (double everything) -> no ADVANCE;
+ * - an equal one -> ADVANCE on the flux trade, from either side.
+ */
+private fun tradeScenarios() {
+    fun p() = side("P", 0, 0f, 2000f, 3000f, 150f, 2, 100f)
+    val weaker = decideAgainst(p(), side("E", 1, 1300f, 1000f, 1500f, 75f, 1, 100f)).first
+    check(weaker.state == org.starficz.combataitweaks.decide.MoveState.ADVANCE, "trade: a weaker enemy -> ADVANCE") { weaker.reason }
+    val stronger = decideAgainst(p(), side("E", 1, 1300f, 4000f, 6000f, 300f, 4, 100f)).first
+    check(stronger.state != org.starficz.combataitweaks.decide.MoveState.ADVANCE, "trade: a stronger enemy -> no ADVANCE") { stronger.reason }
+    // the trade alone: the same guns on a tankier ship (double flux pool and dissipation). Advancing is safe, but
+    // it puts less of the enemy's flux bar on it than it takes off its own
+    val (tank, tankOptions) = decideAgainst(p(), side("E", 1, 1300f, 4000f, 6000f, 300f, 2, 100f))
+    val tankAdvance = tankOptions.first { it.name == "ADVANCE" }
+    check(tankAdvance.overloadsIn < 0f && tankOptions.first { it.name == "ADVANCE~" }.let { MoveRule.ok(it, 100f) },
+        "trade: advancing on the tank is safe (the case tests the trade, not safety)") { tank.reason }
+    check(tank.state != org.starficz.combataitweaks.decide.MoveState.ADVANCE && !MoveRule.favourable(tankAdvance.trade),
+        "trade: a tankier enemy with the same guns -> no ADVANCE (the flux trade loses)") { tank.reason }
+    val (equal, equalOptions) = decideAgainst(p(), side("E", 1, 1300f, 2000f, 3000f, 150f, 2, 100f))
+    check(equal.state == org.starficz.combataitweaks.decide.MoveState.ADVANCE, "trade: an equal enemy -> ADVANCE") { equal.reason }
+    // shields take everything early on, so it is the flux trade that engages: no damage share yet, flux even or better
+    val t = equalOptions.first { it.name == "ADVANCE" }.trade!!
+    check(t.dealtDamage < MoveRule.TRADE_EPS && t.takenDamage < MoveRule.TRADE_EPS && t.dealtFlux >= t.takenFlux && t.takenFlux > 0.1f,
+        "trade: the equal fight engages on the flux trade") { equal.reason }
+    // the other side of the same fight: E's view of P
+    val mirrored = decideAgainst(side("E", 0, 1300f, 2000f, 3000f, 150f, 2, 100f).let {
+        Side(ship("E", owner = 0, x = 1300f, facing = 180f, reach = 700f, engagement = 700f), it.shooter, it.defense)
+    }, side("P", 1, 0f, 2000f, 3000f, 150f, 2, 100f).let {
+        Side(ship("P", owner = 1, x = 0f, facing = 0f, reach = 700f, engagement = 700f), it.shooter, it.defense)
+    })
+    check(mirrored.first.state == org.starficz.combataitweaks.decide.MoveState.ADVANCE, "trade: and the equal enemy engages too") { mirrored.first.reason }
 }
 
 /**

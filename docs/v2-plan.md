@@ -886,6 +886,21 @@ case).
   - two equal ships → both engage on the flux trade.
 - Battle: dealt and taken shares per CAT ship from the trace, predicted vs actual.
 
+As built (2026-11-14), as unit tests (`DamageTests.tradeScenarios`) on the real prediction path:
+- **The path:** the options `MoveController` asks for, each branch's damage with reactions through
+  `DamageSim.branch` (moved out of `PredictorManager`, which now calls it), read through `DamageOutlook` (compiled
+  into the tests too: it is pure), decided by `MoveRule` with the default config's limits.
+- **The setup:** P has 2000 hull, 3000 flux, 150 dissipation and two 200 DPS guns; one enemy starts 1300 away; both
+  have front shields and 700 range guns.
+- **Results:**
+  - a weaker enemy (half of everything) → ADVANCE: flux share 0.93 dealt against 0.19 taken;
+  - a stronger one (double everything) → no ADVANCE: advancing overloads in 8.2 s, so it holds at the standoff;
+  - a tankier one with the same guns (double flux pool and dissipation) → no ADVANCE although advancing is safe:
+    the flux trade loses. This is the case only the trade gate decides;
+  - an equal one → ADVANCE on the flux trade, from either side: no damage share yet, flux 0.44 dealt against 0.40
+    taken. The margin comes from enemies firing under the generous discipline (§13.8), which costs them more flux.
+- The "outranging a slow enemy" case is `standoffTrade` (unit) and the `movecases` standoff phase (§13.4).
+
 Later: fleet coordination (who engages whom, covering each other), §11a's coupling.
 
 ### 13.7 As built (first pass, 2026-11-14)
@@ -904,7 +919,7 @@ Later: fleet coordination (who engages whom, covering each other), §11a's coupl
   `MoveRule.favourable` gates `ADVANCE`: taking nothing is free, or more damage share dealt than taken, or at least
   as much flux share dealt as taken. The reason line shows `trade d dealt/taken f dealt/taken`.
 - **Not built yet:** §13.4 standoff `HOLD` and the trade scenarios of §13.6. (Since built: the standoff, its unit
-  tests and the "outranging a slow enemy" scenario; the other three §13.6 scenarios are still open.)
+  tests and all four §13.6 scenarios.)
 
 Results (`aibattle`, laptop, another game running alongside):
 

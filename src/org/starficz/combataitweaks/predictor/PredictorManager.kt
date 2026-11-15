@@ -30,6 +30,7 @@ import java.awt.Color
 import java.util.*
 import java.util.concurrent.Executors
 import org.starficz.combataitweaks.sim.Scratch
+import org.starficz.combataitweaks.sim.PredictedBranch
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.cos
@@ -218,18 +219,12 @@ class PredictorManager private constructor() {
         } else null
         branches.map { (req, branch) ->
             async {
-                var final = branch
-                var damage = if (quiet) shared
-                             else DamageSim.run(shipId, owner, branch.timelines, inputs, req.withVent, own, pool = pool())
-                val coupling = if (quiet || damage == null) Coupling.NONE
-                               else Reactions.find(world, shipId, branch.committed.keys, damage)
-                if (!coupling.isEmpty()) {
-                    final = if (coupling.reactions.isEmpty()) branch
-                            else world.branch(shipId, req.plan, coupling.reactions)
-                    // the first run's hits are done with (only its outcomes are read): the pool starts over
-                    val again = DamageSim.run(shipId, owner, final.timelines, inputs, false, own, coupling, pool())
-                    if (again != null) damage = again.withVentNow(damage!!.ventNow)
-                }
+                val predicted = if (quiet) PredictedBranch(branch, shared, Coupling.NONE)
+                    else DamageSim.branch(world, shipId, req.plan, branch, inputs, req.withVent, own,
+                        if (lean) Scratch.local() else null)
+                val final = predicted.branch
+                val damage = predicted.damage
+                val coupling = predicted.coupling
                 RequestResult(
                     name = req.name,
                     plan = req.plan,

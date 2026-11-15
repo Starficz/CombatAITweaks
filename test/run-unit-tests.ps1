@@ -26,6 +26,8 @@ $sources = @((Join-Path $Project 'src\org\starficz\combataitweaks\sim'),
     (Join-Path $Project 'src\org\starficz\combataitweaks\decide\rules'),
     (Join-Path $Project 'test')) | ForEach-Object {
     Get-ChildItem -LiteralPath $_ -Recurse -Filter *.kt -File } | ForEach-Object { $_.FullName }
+# DamageOutlook is pure too (sim + rules only): the trade scenarios read branches through it as the decisions do
+$sources += (Join-Path $Project 'src\org\starficz\combataitweaks\predictor\DamageOutlook.kt')
 $argFile = Join-Path $OutDir 'kotlinc.args'
 $ktArgs = @('-no-stdlib', '-no-reflect', '-jvm-target', '17', '-api-version', '2.1', '-language-version', '2.2',
     '-cp', $Stdlib, '-d', "$OutDir\classes") + $sources
