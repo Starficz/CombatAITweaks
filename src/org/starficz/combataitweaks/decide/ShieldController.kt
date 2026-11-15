@@ -32,8 +32,11 @@ class ShieldController(private val ship: ShipAPI) {
     private var lastHard = 0f
     private var lastShieldHit = -1000f
 
-    /** [outlook] is the branch the ship is flying (or holding); null when there is no fresh one. */
-    fun apply(now: Float, outlook: DamageOutlook?) {
+    /**
+     * [outlook] is the branch the ship is flying (or holding); null when there is no fresh one. [holdUp]: a shield
+     * system CAT turned on (the fortress shield) needs the shield up.
+     */
+    fun apply(now: Float, outlook: DamageOutlook?, holdUp: Boolean = false) {
         val shield = ship.shield
         val hard = ship.fluxTracker.hardFlux
         if (hard > lastHard + 1f) lastShieldHit = now
@@ -44,7 +47,7 @@ class ShieldController(private val ship: ShipAPI) {
             nextShieldHit = fresh?.nextShieldHit(now),
             window = window,
             liveThreat = if (shield != null) liveThreat(now, window) else null,
-            blockedBy = blocker(shield),
+            blockedBy = if (holdUp) "shield system on" else blocker(shield),
             flux = ship.fluxTracker.currFlux,
             hardFlux = hard,
             maxFlux = ship.fluxTracker.maxFlux,

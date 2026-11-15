@@ -20,7 +20,7 @@ private fun opt(
         else -> MoveKind.HOLD
     }
     return MoveOption(name, kind, name.endsWith("+SYSTEM"), hull, armor, overloadsIn, flux, hard, escape = name.contains("~"),
-        trade = trade, standoff = name == "STANDOFF")
+        trade = trade, standoff = name.startsWith("STANDOFF"), defense = name.endsWith("+DEFENSE"))
 }
 
 private fun moveInputs(
@@ -142,6 +142,31 @@ internal fun moveRule() {
     check(outranged.state == MoveState.ADVANCE, "move: a standoff that deals nothing doesn't stop an even flux trade") { outranged.reason }
     val pelted = kiteCase(Trade(0.10f, 0.05f, 0.30f, 0.10f), Trade(0.10f, 0.08f, 0.30f, 0.30f))
     check(pelted.state == MoveState.ADVANCE, "move: a standoff that takes damage isn't kiting (the trade rule decides)") { pelted.reason }
+
+    // +DEFENSE (plan §11b): the defensive system is used only when it is the ok one, or clearly saves something
+    val holdHurts = moveInputs(opt("STANDOFF", armor = 400f), opt("STANDOFF+DEFENSE", armor = 120f), opt("HOLD"),
+        opt("ADVANCE~", overloadsIn = 4f), opt("BACK_OFF", armor = 500f))
+    val damper = MoveRule.decide(holdHurts)
+    check(damper.state == MoveState.HOLD && damper.option?.name == "STANDOFF+DEFENSE",
+        "move: a damper that saves a lot on the standoff is used") { damper.reason }
+    val little = MoveRule.decide(moveInputs(opt("STANDOFF", armor = 60f), opt("STANDOFF+DEFENSE", armor = 30f), opt("HOLD"),
+        opt("ADVANCE~", overloadsIn = 4f), opt("BACK_OFF")))
+    check(little.option?.name == "STANDOFF", "move: a defensive system saving under 50 is kept for later") { little.reason }
+    val rescued = MoveRule.decide(moveInputs(opt("STANDOFF", overloadsIn = 3f), opt("STANDOFF+DEFENSE"), opt("HOLD", overloadsIn = 3f),
+        opt("ADVANCE~", overloadsIn = 2f), opt("BACK_OFF", overloadsIn = 4f)))
+    check(rescued.state == MoveState.HOLD && rescued.option?.name == "STANDOFF+DEFENSE",
+        "move: holding is ok only with the defensive system -> HOLD with it") { rescued.reason }
+    check(MoveRule.decide(moveInputs(opt("STANDOFF", overloadsIn = 3f), opt("STANDOFF+DEFENSE", overloadsIn = 5f),
+        opt("HOLD", overloadsIn = 3f), opt("ADVANCE~", overloadsIn = 2f), opt("BACK_OFF"))).option?.name == "BACK_OFF",
+        "move: a defensive variant that isn't ok either doesn't make HOLD ok")
+    val runShielded = MoveRule.decide(moveInputs(*set(holdEsc = stuck, advEsc = stuckAdv,
+        backOffs = listOf(opt("BACK_OFF", overloadsIn = 5f), opt("BACK_OFF+DEFENSE")))))
+    check(runShielded.state == MoveState.BACK_OFF && runShielded.option?.name == "BACK_OFF+DEFENSE",
+        "move: only the defensive back-off is ok -> uses it") { runShielded.reason }
+    val plainCalm = MoveRule.decide(moveInputs(*set(), opt("HOLD+DEFENSE")))
+    check(plainCalm.option?.defense != true, "move: nothing threatening -> no defensive system") { plainCalm.reason }
+    val ventPlain = MoveRule.decide(moveInputs(*set(), opt("BACK_OFF+DEFENSE"), venting = true, ventOption = "BACK_OFF"))
+    check(ventPlain.option?.name == "BACK_OFF", "move: venting never drives a defensive variant") { ventPlain.reason }
 
     val venting = MoveRule.decide(moveInputs(*set(), venting = true, ventOption = "HOLD"))
     check(venting.state == MoveState.VENTING && venting.option?.name == "HOLD", "move: venting drives the vent's option") { venting.reason }

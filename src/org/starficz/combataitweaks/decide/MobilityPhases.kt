@@ -4,8 +4,6 @@ import com.fs.starfarer.api.combat.ShipAPI
 import com.fs.starfarer.api.combat.ShipSystemAPI
 import org.lazywizard.lazylib.combat.AIUtils
 import org.starficz.combataitweaks.capture.ProfileStat
-import org.starficz.combataitweaks.capture.StatModifier
-import org.starficz.combataitweaks.capture.StatView
 import org.starficz.combataitweaks.capture.SystemProfile
 import org.starficz.combataitweaks.capture.SystemProfiles
 import org.starficz.combataitweaks.capture.SystemUse
@@ -61,11 +59,5 @@ object MobilityPhases {
             MotionPhase(sys.chargeUpDur + sys.chargeActiveDur + sys.chargeDownDur, speed, accel, decel),
             MotionPhase(Float.MAX_VALUE, offSpeed, offAccel, offDecel),
         )
-    }
-
-    /** The stat's value with [sourceId]'s modifiers replaced by [with] (MutableStat.recompute()'s formula). */
-    private fun StatView.valueWith(sourceId: String, with: StatModifier?): Float {
-        val (flat, percent, mult) = sumsWithout(sourceId, with)
-        return (base + base * percent / 100f + flat) * mult
     }
 }

@@ -21,6 +21,8 @@ public final class MoveCases {
 
     static final String FRIGATE = System.getProperty("cat.move.frigate", "brawler_Assault");
     static final String AUTOMATED = System.getProperty("cat.move.automated", "warden_Defense");
+    /** A frigate with the damper as its ship system (plan §11b: CAT decides it). */
+    static final String DAMPER = System.getProperty("cat.move.damper", "centurion_Assault");
     static final String PARKED = "ox_Standard";
 
     public static List<Step> steps() {
@@ -34,7 +36,7 @@ public final class MoveCases {
         player.getCargo().addFuel(1000);
         for (FleetMemberAPI m : player.getFleetData().getMembersListCopy()) player.getFleetData().removeFleetMember(m);
 
-        for (String variant : new String[]{FRIGATE, AUTOMATED}) {
+        for (String variant : new String[]{FRIGATE, AUTOMATED, DAMPER}) {
             FleetMemberAPI p = Global.getFactory().createFleetMember(FleetMemberType.SHIP, variant);
             ShipVariantAPI v = p.getVariant().clone();
             v.addTag(AiBattle.ENABLE_TAG);

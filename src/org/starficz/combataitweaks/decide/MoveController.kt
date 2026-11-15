@@ -10,6 +10,7 @@ import org.starficz.combataitweaks.CombatAIv2
 import org.starficz.combataitweaks.predictor.OptionRequest
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.ADVANCE
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.BACK_OFF
+import org.starficz.combataitweaks.predictor.PredictorManager.Companion.DEFENSE_SUFFIX
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.HOLD
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.STANDOFF
 import org.starficz.combataitweaks.predictor.PredictorManager.Companion.SYSTEM_SUFFIX
@@ -37,7 +38,9 @@ import kotlin.math.sqrt
  * - [apply] sets the state's flags every frame (each for 0.1 s), thrusts directly where vanilla won't back off
  *   (automated ships), and uses or blocks the mobility system.
  */
-class MoveController(private val ship: ShipAPI, private val config: CombatAIConfig) {
+class MoveController(
+    private val ship: ShipAPI, private val config: CombatAIConfig, private val defense: DefenseController,
+) {
 
     private val decider = MoveDecider()
     private val profile = MobilityPhases.of(ship)
@@ -66,12 +69,17 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
      *   reach (plan §13.4, its own safety and flux).
      * - `ADVANCE`: close to range and stay (its flux limit); `ADVANCE~`: do it for [REACTION_TIME], then escape (its
      *   safety).
+     * - `+DEFENSE` (plan §11b): `HOLD`, `STANDOFF` and `BACK_OFF` with the defensive system used now, when it can be;
+     *   every other option keeps it off.
      */
     fun options(target: ShipAPI?, latest: Map<String, RequestResult>): List<OptionRequest> {
         val plain = if (profile != null) MobilityPhases.plainPhases(ship) else emptyList()
         val sys = profile?.let { MobilityPhases.systemPhases(ship, it) }
-        val list = ArrayList<OptionRequest>(11)
+        val off = defense.plainPlan()
+        val on = defense.defensePlan()
+        val list = ArrayList<OptionRequest>(14)
         list += OptionRequest(HOLD, OwnPlan.Hold(plain), withVent = true)
+        if (on != null) list += OptionRequest(HOLD + DEFENSE_SUFFIX, OwnPlan.Hold(plain), withVent = false, on)
         if (target != null) {
             val committed = latest[HOLD]?.committed?.keys ?: emptySet()
             val centre = threatCentre(committed)
@@ -87,6 +95,10 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
                 !lastVanillaBackOffFree
             list += OptionRequest(STANDOFF, OwnPlan.Standoff(target.id, plain), withVent = false)
             list += OptionRequest(BACK_OFF, OwnPlan.BackAway(target.id, plain), withVent = true)
+            if (on != null) {
+                list += OptionRequest(STANDOFF + DEFENSE_SUFFIX, OwnPlan.Standoff(target.id, plain), withVent = false, on)
+                list += OptionRequest(BACK_OFF + DEFENSE_SUFFIX, OwnPlan.BackAway(target.id, plain), withVent = false, on)
+            }
             if (advanceMatters) {
                 list += OptionRequest(ADVANCE + ESCAPE, thenEscape(OwnPlan.Approach(target.id, plain)), withVent = false)
                 // keeping it up (close to range and stay): the flux it builds, for the advance flux limit
@@ -112,7 +124,9 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
                 }
             }
         }
-        return list
+        // every option without the suffix keeps the defensive system off
+        if (off == null) return list
+        return list.map { if (it.system != null) it else OptionRequest(it.name, it.plan, it.withVent, off) }
     }
 
     /**
@@ -188,10 +202,9 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
                 else -> MoveKind.HOLD
             }
             r.outlook.moveOption(r.name, kind, r.name.endsWith(SYSTEM_SUFFIX), now, ship.maxFlux, r.name.contains(ESCAPE),
-                standoff = r.name == STANDOFF)
+                standoff = r.name.startsWith(STANDOFF), defense = r.name.endsWith(DEFENSE_SUFFIX))
         }
-        val hullLimit = if (ship.hullLevel < config.stopVentingBelowHullLevel) VentRule.HULL_EPSILON
-            else ship.maxHitpoints * config.maxHullDamageLevelToVent
+        val hullLimit = hullLimit()
         lastHoldOk = options.firstOrNull { it.name == STANDOFF }?.let { MoveRule.ok(it, hullLimit) } ?: true
         lastVanillaBackOffFree = options.firstOrNull { it.name == BACK_OFF }?.let { MoveRule.ok(it, hullLimit) && it.cost <= 0f } ?: false
         if (options.none { it.kind == MoveKind.HOLD }) {
@@ -200,20 +213,7 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
         }
         val advance = fresh.firstOrNull { it.name == ADVANCE + ESCAPE }
         val gap = advance?.let { MathUtils.getDistance(ship.location, target.location) - it.approachRange } ?: 0f
-        val c = decider.decide(now, MoveInputs(
-            options = options,
-            venting = ship.fluxTracker.isVenting,
-            ventOption = vent.activeVent?.option?.name,
-            fluxLevel = ship.fluxLevel,
-            hullLimit = hullLimit,
-            previous = decider.state,
-            advanceGap = gap.coerceAtLeast(0f),
-            forceAdvanceIfFluxBelowLevel = config.forceAdvanceIfFluxBelowLevel,
-            backoffIfFluxAboveLevel = config.backoffIfFluxAboveLevel,
-            backoffIfHardfluxAboveLevel = config.backoffIfHardfluxAboveLevel,
-            reengageIfFluxDropsBelowLevel = config.reengageIfFluxDropsBelowLevel,
-            maxFluxLevelRaiseToHarass = config.maxFluxLevelRaiseToHarass,
-        ))
+        val c = decider.decide(now, inputs(options, vent.activeVent?.option?.name, hullLimit, gap.coerceAtLeast(0f)))
         choice = c
         driven = c.option?.let { o -> fresh.firstOrNull { it.name == o.name } } ?: fresh.firstOrNull { it.name == HOLD }
         this.target = target
@@ -221,6 +221,38 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
         ship.setCustomData(TRACE, c.reason)
         ship.setCustomData(OPTION, c.option?.name)
         return c
+    }
+
+    /** Hull lost over the horizon above this makes an option not ok (the vent's limit). */
+    private fun hullLimit() = if (ship.hullLevel < config.stopVentingBelowHullLevel) VentRule.HULL_EPSILON
+        else ship.maxHitpoints * config.maxHullDamageLevelToVent
+
+    private fun inputs(options: List<MoveOption>, ventOption: String?, hullLimit: Float, gap: Float) = MoveInputs(
+        options = options,
+        venting = ship.fluxTracker.isVenting,
+        ventOption = ventOption,
+        fluxLevel = ship.fluxLevel,
+        hullLimit = hullLimit,
+        previous = decider.state,
+        advanceGap = gap,
+        forceAdvanceIfFluxBelowLevel = config.forceAdvanceIfFluxBelowLevel,
+        backoffIfFluxAboveLevel = config.backoffIfFluxAboveLevel,
+        backoffIfHardfluxAboveLevel = config.backoffIfHardfluxAboveLevel,
+        reengageIfFluxDropsBelowLevel = config.reengageIfFluxDropsBelowLevel,
+        maxFluxLevelRaiseToHarass = config.maxFluxLevelRaiseToHarass,
+    )
+
+    /**
+     * With CAT standing down (no enemy ship near, plan §8.5) the defensive system is still CAT's: used when keeping on
+     * as vanilla does is worse than with it (torpedoes with no ship near). `HOLD` stands in for vanilla's movement.
+     */
+    fun standingDownDefense(now: Float, results: Map<String, RequestResult>): Boolean {
+        fun option(name: String, defense: Boolean) = results[name]?.takeIf { now - it.outlook.startTime <= VentController.MAX_AGE }
+            ?.outlook?.moveOption(name, MoveKind.HOLD, false, now, ship.maxFlux, defense = defense)
+        val hold = option(HOLD, false) ?: return false
+        val withSystem = option(HOLD + DEFENSE_SUFFIX, true) ?: return false
+        if (ship.fluxTracker.isVenting) return false
+        return MoveRule.withDefense(inputs(listOf(hold, withSystem), null, hullLimit(), 0f), hold) === withSystem
     }
 
     /** Gives the ship back to vanilla (no enemies, no prediction, standing down). */
@@ -243,7 +275,7 @@ class MoveController(private val ship: ShipAPI, private val config: CombatAIConf
         // the override when it next picks a maneuver and then clears it, so it is set every frame (as vanilla's
         // own DarkenedGazeSystemAI does)
         if (c.state != MoveState.HOLD) holdRange = -1f
-        val standoffRange = driven?.takeIf { it.name == STANDOFF }?.standoffRange?.takeIf { it > 0f }
+        val standoffRange = driven?.takeIf { it.name.startsWith(STANDOFF) }?.standoffRange?.takeIf { it > 0f }
         if (target != null && c.state == MoveState.HOLD) {
             if (standoffRange != null) {
                 // vanilla's strafe backs up only once it is 100 inside its range: start that at the standoff

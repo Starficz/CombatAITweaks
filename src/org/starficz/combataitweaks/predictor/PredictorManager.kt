@@ -67,6 +67,8 @@ class PredictorManager private constructor() {
         const val ADVANCE = "ADVANCE"
         const val BACK_OFF = "BACK_OFF"
         const val SYSTEM_SUFFIX = "+SYSTEM"
+        /** The option with the ship's defensive system used now (plan §11b). */
+        const val DEFENSE_SUFFIX = org.starficz.combataitweaks.decide.MoveRule.DEFENSE_SUFFIX
         fun getInstance(engine: CombatEngineAPI): PredictorManager {
             if (!engine.customData.containsKey(DATA_KEY)) {
                 engine.customData[DATA_KEY] = PredictorManager()
@@ -212,16 +214,22 @@ class PredictorManager private constructor() {
         val own = OwnFire(ship.maneuverTargetId, resolveTargets = true, sideHits = sideHits)
         val branches = options.map { it to world.branch(shipId, it.plan) }
         val quiet = branches.all { it.second.committed.isEmpty() }
+        val holdBranch = branches.firstOrNull { it.first.name == HOLD } ?: branches.first()
         val shared = if (quiet) {
-            val hold = branches.firstOrNull { it.first.name == HOLD } ?: branches.first()
-            DamageSim.run(shipId, owner, hold.second.timelines, inputs, withVent = branches.any { it.first.withVent },
-                own, pool = pool())
+            DamageSim.run(shipId, owner, holdBranch.second.timelines, inputs, withVent = branches.any { it.first.withVent },
+                own, pool = pool(), ownSystem = holdBranch.first.system)
         } else null
         branches.map { (req, branch) ->
             async {
-                val predicted = if (quiet) PredictedBranch(branch, shared, Coupling.NONE)
-                    else DamageSim.branch(world, shipId, req.plan, branch, inputs, req.withVent, own,
-                        if (lean) Scratch.local() else null)
+                // quiet: every option reads the hold branch's damage, except one with another defensive system
+                // (torpedoes with no ship committed: the system is what changes the outcome)
+                val predicted = when {
+                    !quiet -> DamageSim.branch(world, shipId, req.plan, branch, inputs, req.withVent, own,
+                        if (lean) Scratch.local() else null, req.system)
+                    req.system === holdBranch.first.system -> PredictedBranch(branch, shared, Coupling.NONE)
+                    else -> PredictedBranch(branch, DamageSim.run(shipId, owner, branch.timelines, inputs, req.withVent,
+                        own, pool = pool(), ownSystem = req.system), Coupling.NONE)
+                }
                 val final = predicted.branch
                 val damage = predicted.damage
                 val coupling = predicted.coupling

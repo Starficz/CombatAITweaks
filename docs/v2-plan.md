@@ -608,11 +608,13 @@ a Lasher or Hammerhead with its Accelerated Ammo Feeder ready doubles its ballis
 1. **Enemies (built):** worst case: on as soon as it is ready and a weapon it strengthens could fire (in range with
    the boost, in arc, aimed), counted at full strength over the whole on-time. No branches added. For the vent-now
    run "as soon as ready" already lands in the vent, which starts at t = 0.
-2. **P, as vanilla would (next):** one rule inside every branch, from vanilla's system AIs (the damper's is in
-   obfuscated `combat.ai.system`, reading `DamperFieldStats.getDamper`; not translated yet). P's own offensive
-   systems count only when already on at the snapshot, without charge-down: vanilla decides them, so the trade
-   doesn't count on them.
-3. **`+DEFENSE` options (after):** like `+SYSTEM`: the option with the system used now, on the options where it
+2. **P, as vanilla would: dropped (agreed 2026-11-15).** Vanilla's damper AI (translation of obfuscated
+   `combat.ai.system.O00O`) times the damper from vanilla's internal threat estimate (`combat.ai.C`), which the sim
+   can't reproduce for future moments, and it fights CAT's vent (it sets `DO_NOT_VENT` while the damper is on).
+   Instead CAT decides P's defensive systems and blocks vanilla's own use, as the mobility systems do
+   (`enforce_override`): the sim can count on a use because CAT makes it. P's own offensive systems still count only
+   when already on at the snapshot, without charge-down: vanilla decides those.
+3. **`+DEFENSE` options (next):** like `+SYSTEM`: the option with the system used now, on the options where it
    matters (likely `HOLD`, `STANDOFF`, `BACK_OFF`: the damper blocks venting and the shield, the fortress blocks
    firing). Each batch asks "now or not now"; batches re-ask every fraction of a second, which is the timing search.
    "Not now" assumes no use within H (conservative). About +2–3 branches, only for ships with such a system.
@@ -653,6 +655,56 @@ range bonus); those stay. Adding a stat is one `ProfileStat` entry plus whatever
   matches the fire cycle (6000 with the system, 5100 without); with the system on, the captured weapons equal the
   system-off capture. `movecases`, `aibattle` and `worstcase` pass.
 - Not yet seen in game: a learned profile (no offensive system without a row came up).
+
+**Built 2026-11-15 (defence, first part: a system already on at the snapshot):** before this, the defence capture
+read the damage-taken mults and upkeep as they were, so a damper on at the snapshot counted for the whole horizon
+(x0.33 armor and hull damage on a frigate: badly optimistic), and its restrictions didn't exist in the sim.
+- Capture (`capture/SystemCapture.kt`): the system on now (the right-click slot first, then the ship system, as
+  `DamperFieldStats.getDamper`; not a phase cloak). The ship's shield, armor and hull damage-taken mults and upkeep are
+  captured without its `"<id> effect"` modifiers; `SimDefense.system` (`DefenseSystem`) holds the live values, its
+  on-time, the spec's restrictions (`isShieldAllowed`, `isVentingAllowed`, `isFiringAllowed`) and its flux per second.
+  No profile needed: it reads what the system does now, so it works for any system that uses its id.
+- Sim (`DefenseResolver`): the effect counts until the system ends; for the protected ship without its charge-down
+  (conservative), for an enemy it fires at with it (worst case for the trade). Restrictions last the whole on-time:
+  no shield (and the shield unfolds from nothing afterwards), the ship's own fire silenced, and `VENT_NOW` waits for
+  the system to end (dissipation only until then). The system's flux per second is added while on (hard if the spec
+  says so).
+- A toggle that is on (fortress shield) reports no end, so it stays on for the horizon, effect and restrictions.
+  For P that is no longer an assumption: CAT decides it (below), so the plain options turn it off and `+DEFENSE`
+  keeps it on.
+
+**Built 2026-11-15 (defence, second part: CAT decides P's defensive system):**
+- Profiles: `use` defensive rows for `damper` (armor and hull x0.33, x0.5 on cruisers and capitals), `damper_omega`
+  (x0.5) and `fortressshield` (shield damage x0.1, upkeep x0); new columns `shield_damage_taken`,
+  `armor_damage_taken`, `hull_damage_taken`, `shield_upkeep`. A cell can hold values per hull size
+  (`x0.33; cruiser capital: x0.5`, `SystemProfile.forSize`). `SystemProfiles.defensive(ship)` finds it in either slot.
+- Branches (`MoveController.options`): `HOLD`, `STANDOFF` and `BACK_OFF` get a `+DEFENSE` variant when the system can
+  be used now (idle, a charge, not venting) or is a toggle that is on. Each request carries a `SystemPlan` that
+  replaces the captured system for P in that branch: `+DEFENSE` the planned use (`plannedDefenseSystem`: the profile on
+  the ship's system-off values, effect from the end of the charge-up, restrictions and flux over the whole use, a
+  toggle for the horizon); every other option keeps it off (a toggle that is on turns off now: its charge-down's
+  restrictions, no effect). Up to 3 branches more, only for ships with such a system. A quiet batch (no enemy commits)
+  still runs the damage once per distinct system plan: torpedoes with no ship near are where the damper matters.
+- Decision (`MoveRule`): a `+DEFENSE` variant is driven when it is ok and its plain option isn't, or it clearly saves
+  (the `+SYSTEM` rule: at most 0.8 of the cost and 50 less), and it can make `HOLD` ok. Never while venting, never on
+  `ADVANCE`. Standing down (no enemy ship near) CAT still compares `HOLD` with `HOLD+DEFENSE`.
+- Control (`DefenseController`): uses the system while a `+DEFENSE` option is driven (lowering the shield first for a
+  damper), blocks vanilla's use otherwise; a toggle flips to match and stays on at least 3 s. The shield flicker keeps
+  the shield up while a shield system is on. The vent blocker knows a damper in the right-click slot.
+- Tests: unit 339 (the rule: used when it saves a lot or is the only ok one, kept for later under 50, never while
+  venting or when calm; the resolver: a planned use protects only after its charge-up, an enemy's from the start, a
+  branch's plan replaces or drops the captured system, a toggle turning off protects no more). `movecases` damper
+  case: a CAT Centurion pinned, two Reapers from 1200, then 85% hard flux: CAT uses the damper (standing down: no ship
+  near; the prediction without it 1617 hull, it lost 440), and the damper never came on without CAT choosing it over
+  the whole run. `ventcases`, `aibattle`, `worstcase` pass.
+- Next refinements: use it as late as still covers the hits (it is used as soon as a use saves: in the case above the
+  torpedoes landed 3.1 s into its 3.25 s); the fortress shield not yet seen in game; enemy defensive systems in P's
+  trade (only one already on counts).
+- Tests: unit 327 (`defenseSystems`: effect window, charge-down for P and the worst case, armor, the shield blocked
+  and unfolding after, the held vent, a fortress-like toggle's shield mult and upkeep, system flux, silenced fire).
+  `ventcases` damper case: an own-side Centurion (damper as the ship system) and Vanguard (damper in the right-click
+  slot): idle no system captured; on, the system carries the live x0.33, the ship keeps x1.00, 3.25 s left (0.25
+  charge-down), no shield, vent or firing. `movecases`, `aibattle`, `worstcase` pass.
 
 ## 11c. Progress
 

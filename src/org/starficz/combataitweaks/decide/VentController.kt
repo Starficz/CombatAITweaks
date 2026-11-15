@@ -103,6 +103,11 @@ class VentController(private val ship: ShipAPI, private val config: CombatAIConf
             (system.isOn || system.isChargeup || system.state == ShipSystemAPI.SystemState.ACTIVE)) {
             return "system ${system.id} active"
         }
+        // a damper in the right-click slot (Vanguard) forbids venting while it is on
+        val right = ship.phaseCloak
+        if (right != null && right.specAPI?.isPhaseCloak != true && right.isOn && right.specAPI?.isVentingAllowed == false) {
+            return "system ${right.id} active"
+        }
         return null
     }
 

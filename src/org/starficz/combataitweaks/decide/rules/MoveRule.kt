@@ -43,6 +43,11 @@ class MoveOption(
      * safety and its flux. Wins over `HOLD~` and plain `HOLD` (then kept for the vent) in judging the `HOLD` state.
      */
     val standoff: Boolean = false,
+    /**
+     * Uses the ship's defensive system now (plan §11b, `+DEFENSE`): a variant of the option with the same name
+     * without the suffix. Picked over it only when it clearly saves something ([MoveRule.withDefense]).
+     */
+    val defense: Boolean = false,
 ) {
     val cost get() = MoveRule.cost(armorLost, hullLost)
 }
@@ -109,6 +114,8 @@ object MoveRule {
     const val ALLY_BACK_OFF = "BACK_OFF@ally"
     /** Shares below this are nothing (a stray hit, flux noise). */
     const val TRADE_EPS = 0.01f
+    /** Suffix of an option's variant with the ship's defensive system used now (plan §11b). */
+    const val DEFENSE_SUFFIX = "+DEFENSE"
 
     fun cost(armor: Float, hull: Float) = VentRule.cost(armor, hull)
 
@@ -157,7 +164,9 @@ object MoveRule {
         val advanceFlux = keepingOn(i, MoveKind.ADVANCE) ?: stand ?: advance
         val hold = judged(i, MoveKind.HOLD)
         val holdFlux = if (hold?.standoff == true) hold else stand ?: hold
-        val holdOk = hold != null && ok(hold, i.hullLimit) && fluxBelow(holdFlux!!, i.backoffIfFluxAboveLevel, i)
+        val holdDefense = hold?.let { defenseOf(i, it) }
+        val holdOk = (hold != null && ok(hold, i.hullLimit) && fluxBelow(holdFlux!!, i.backoffIfFluxAboveLevel, i)) ||
+            (holdDefense != null && ok(holdDefense, i.hullLimit) && fluxBelow(holdDefense, i.backoffIfFluxAboveLevel, i))
         val fullAdvance = keepingOn(i, MoveKind.ADVANCE)
         if (advance != null && ok(advance, i.hullLimit) && fluxBelow(advanceFlux!!, i.forceAdvanceIfFluxBelowLevel, i) &&
             favourable(fullAdvance?.trade) && !(holdOk && kitesBetter(hold!!, fullAdvance))) {
@@ -176,27 +185,57 @@ object MoveRule {
 
     /** The plain option of a kind: kept up for the whole horizon (no escape, no system, not the standoff). */
     private fun keepingOn(i: MoveInputs, kind: MoveKind) =
-        i.options.firstOrNull { it.kind == kind && !it.system && !it.escape && !it.standoff }
+        i.options.firstOrNull { it.kind == kind && !it.system && !it.defense && !it.escape && !it.standoff }
 
     /**
      * The option a state is judged by: the standoff, else its "then escape" variant when there is one, else the
      * plain one.
      */
     private fun judged(i: MoveInputs, kind: MoveKind): MoveOption? {
-        val candidates = i.options.filter { it.kind == kind && !it.system }
+        val candidates = i.options.filter { it.kind == kind && !it.system && !it.defense }
         return candidates.firstOrNull { it.standoff } ?: candidates.firstOrNull { it.escape } ?: candidates.firstOrNull()
+    }
+
+    /** [base]'s `+DEFENSE` variant, or null. */
+    fun defenseOf(i: MoveInputs, base: MoveOption): MoveOption? =
+        i.options.firstOrNull { it.defense && it.name == base.name + DEFENSE_SUFFIX }
+
+    /**
+     * [base], or its `+DEFENSE` variant when the variant is ok and [base] isn't, or it clearly saves: at most
+     * [SYSTEM_GAIN] of [base]'s cost and [SYSTEM_MIN_SAVING] less (the system's uses are kept for when they matter).
+     */
+    fun withDefense(i: MoveInputs, base: MoveOption?): MoveOption? {
+        if (base == null) return null
+        val d = defenseOf(i, base) ?: return base
+        return if (better(d, base, i.hullLimit)) d else base
+    }
+
+    /**
+     * Whether the defensive variant [d] is worth using over [base] (see [withDefense]): ok where [base] isn't, or
+     * (both ok, or neither) clearly cheaper.
+     */
+    private fun better(d: MoveOption, base: MoveOption, hullLimit: Float): Boolean {
+        val dOk = ok(d, hullLimit); val baseOk = ok(base, hullLimit)
+        if (dOk != baseOk) return dOk
+        return d.cost <= base.cost * SYSTEM_GAIN && base.cost - d.cost >= SYSTEM_MIN_SAVING
     }
 
     /** [state] with the option it drives and the reason line. */
     fun choose(state: MoveState, i: MoveInputs): MoveChoice {
         val option = when (state) {
             MoveState.ADVANCE -> advanceOption(i)
-            MoveState.HOLD -> judged(i, MoveKind.HOLD)?.takeIf { ok(it, i.hullLimit) } ?: stand(i) ?: judged(i, MoveKind.HOLD)
-            MoveState.BACK_OFF -> pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF && ok(it, i.hullLimit) })
-                ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF })
-            MoveState.DISENGAGE -> pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF })
-            MoveState.VENTING -> i.options.firstOrNull { it.name == i.ventOption && !it.system }
-                ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF && !it.system })
+            MoveState.HOLD -> {
+                // the option HOLD is judged by with its defensive system first: that may be what makes HOLD ok
+                val held = judged(i, MoveKind.HOLD)
+                val d = held?.let { defenseOf(i, it) }
+                if (held != null && d != null && better(d, held, i.hullLimit)) d
+                else withDefense(i, held?.takeIf { ok(it, i.hullLimit) } ?: stand(i) ?: held)
+            }
+            MoveState.BACK_OFF -> pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF && ok(it, i.hullLimit) },
+                i.hullLimit) ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF }, i.hullLimit)
+            MoveState.DISENGAGE -> pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF }, i.hullLimit)
+            MoveState.VENTING -> i.options.firstOrNull { it.name == i.ventOption && !it.system && !it.defense }
+                ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF && !it.system && !it.defense })
         }
         val head = if (option != null) "$state ${option.name}" else "$state (no option)"
         return MoveChoice(state, option, if (Explain.enabled) head + ": " + table(i) else head)
@@ -215,18 +254,23 @@ object MoveRule {
     /**
      * The cheapest back-off; on a tie toward the friendly ships ([ALLY_BACK_OFF]), then vanilla's own direction
      * ([VANILLA_BACK_OFF]), then the lowest end flux. A system variant only when it clearly saves something (keep the
-     * system for later).
+     * system for later). The same for a `+DEFENSE` variant ([better]).
      */
-    fun pickBackOff(candidates: List<MoveOption>): MoveOption? {
-        val plain = candidates.filter { !it.system }.minWithOrNull(compareBy<MoveOption>(
+    fun pickBackOff(candidates: List<MoveOption>, hullLimit: Float = Float.MAX_VALUE): MoveOption? {
+        val plain = candidates.filter { !it.system && !it.defense }.minWithOrNull(compareBy<MoveOption>(
             { it.cost },
             { when (it.name) { ALLY_BACK_OFF -> 0; VANILLA_BACK_OFF -> 1; else -> 2 } },
             { it.endFlux },
         ))
         val sys = candidates.filter { it.system }.minByOrNull { it.cost }
-        if (plain == null) return sys
-        if (sys == null) return plain
-        return if (sys.cost <= plain.cost * SYSTEM_GAIN && plain.cost - sys.cost >= SYSTEM_MIN_SAVING) sys else plain
+        val moving = when {
+            plain == null -> sys
+            sys == null -> plain
+            sys.cost <= plain.cost * SYSTEM_GAIN && plain.cost - sys.cost >= SYSTEM_MIN_SAVING -> sys
+            else -> plain
+        }
+        val d = candidates.filter { it.defense }.minByOrNull { it.cost } ?: return moving
+        return if (moving == null || better(d, moving, hullLimit)) d else moving
     }
 
     /**

@@ -27,10 +27,18 @@ import java.util.Map;
 //  standoff:  a slow Enforcer with only chainguns (450) 1300 away, against the Brawler's Arbalests (700)
 //             -> HOLD at the standoff (plan §13.4), or ADVANCE where that is out of reach too: it deals damage
 //             and takes none
+//  damper:    a CAT Centurion (damper) pinned, two Reaper torpedoes inbound from 1200, then 85% hard flux: its shield can't take them,
+//             so CAT uses the damper (a +DEFENSE option driven when it comes on). Throughout the run the damper never
+//             comes on without CAT choosing it (vanilla's own use is blocked).
 public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
     private static final Logger log = Global.getLogger(MoveCasesDriver.class);
 
-    private enum Phase { WARMUP, ADVANCE, THREAT, AUTOMATED, STANDOFF, DONE }
+    private enum Phase { WARMUP, ADVANCE, THREAT, AUTOMATED, STANDOFF, DAMPER, DONE }
+
+    private ShipAPI damper;
+    private boolean damperWasOn = false, catUsedDamper = false;
+    private String vanillaDamperUse = null, damperOption = null;
+    private final List<com.fs.starfarer.api.combat.CombatEntityAPI> torpedoes = new java.util.ArrayList<>();
 
     private static final int PHASE_FRAMES = 600;
     private static final Vector2f AWAY = new Vector2f(-6000f, 6000f);
@@ -131,6 +139,12 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
             note(phase.name().toLowerCase() + " t=" + String.format("%.1f", age() / 60f) + "s: " + st + " - " + reason(p));
             lastState = st;
         }
+        // the first back-off counts from the start: one in the first second is the decision the case is about
+        boolean backingNow = st.equals("BACK_OFF") || st.equals("DISENGAGE");
+        if (backingNow && firstBackOff < 0) {
+            firstBackOff = age();
+            firstBackOffReason = reason(p);
+        }
         if (age() < 60) return;   // let the first predictions arrive
         samples++;
         states.merge(st, 1, Integer::sum);
@@ -142,11 +156,6 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
         if (d > 1f) {
             radialSum += (p.getVelocity().x * dx + p.getVelocity().y * dy) / d;
             radialSamples++;
-        }
-        boolean backing = st.equals("BACK_OFF") || st.equals("DISENGAGE");
-        if (backing && firstBackOff < 0) {
-            firstBackOff = age();
-            firstBackOffReason = reason(p);
         }
     }
 
@@ -215,6 +224,7 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
                 if (s.getOwner() == 1) parkedEnemy = s;
                 else if (isHull(s, MoveCases.FRIGATE)) frigate = s;
                 else if (isHull(s, MoveCases.AUTOMATED)) automated = s;
+                else if (isHull(s, MoveCases.DAMPER)) damper = s;
                 else if (s.getHullSpec().getHullId().startsWith("ox")) flag = s;
             }
             expect(frigate != null && automated != null && flag != null && parkedEnemy != null, "ships deployed");
@@ -226,6 +236,8 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
         pin(parkedEnemy, 9000f, 9000f);
         if (p != frigate) pin(frigate, AWAY.x, AWAY.y);
         if (p != automated) pin(automated, AWAY.x + 400f, AWAY.y);
+        if (damper != null && p != damper) pin(damper, AWAY.x - 400f, AWAY.y);
+        watchDamper();
 
         switch (phase) {
             case WARMUP:
@@ -311,9 +323,52 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
                             String.format("standoff: takes no damage (hull %.0f, armor %.0f, shield hard flux %.0f)", hullLost, armorLost, maxHardFlux));
                     expect(dealtHull + dealtArmor > 0f || threatMaxFlux > 0f,
                             String.format("standoff: deals damage (hull %.0f, armor %.0f, flux %.0f)", dealtHull, dealtArmor, threatMaxFlux));
+                    if (threat != null) engine.removeEntity(threat);
+                    threat = null;
+                    expect(damper != null, "damper: Centurion deployed");
+                    if (damper == null) { finish(); break; }
+                    enter(Phase.DAMPER, damper);
+                    startArmor = armor(damper);
+                }
+                break;
+            case DAMPER: {
+                // pinned (it can't dodge). The torpedoes first, so the prediction sees them before the flux rises (a
+                // ship at high flux with nothing in sight vents at once, and can't use the damper while venting); then
+                // its flux high and hard: the shield can't take them
+                pin(damper, 0f, 0f);
+                if (age() == 1) {
+                    for (float x : new float[]{-60f, 60f}) {
+                        com.fs.starfarer.api.combat.CombatEntityAPI t = engine.spawnProjectile(parkedEnemy, null, "reaper",
+                                new Vector2f(x, 1200f), 270f, null);
+                        if (t != null) torpedoes.add(t);
+                    }
+                    expect(torpedoes.size() == 2, "damper: two Reaper torpedoes spawned 1200 away");
+                }
+                if (age() == 20) {
+                    damper.getFluxTracker().setCurrFlux(0.85f * damper.getMaxFlux());
+                    damper.getFluxTracker().setHardFlux(0.85f * damper.getMaxFlux());
+                }
+                if (age() > 20 && age() % 20 == 0) {
+                    Object option = damper.getCustomData().get(MoveController.OPTION);
+                    note(String.format("damper t=%.1fs: %s option %s, using %s, system %s, flux %.2f; HOLD %s; HOLD+DEFENSE %s; %s",
+                            age() / 60f, state(damper), option,
+                            damper.getCustomData().get(org.starficz.combataitweaks.decide.DefenseController.USING),
+                            damper.getSystem() == null ? "-" : damper.getSystem().getState(), damper.getFluxLevel(),
+                            predicted("HOLD"), predicted("HOLD+DEFENSE"), reason(damper)));
+                }
+                boolean gone = age() > 20 && torpedoes.stream().noneMatch(engine::isEntityInPlay);
+                if ((gone && age() > 240) || age() > 600 || !damper.isAlive()) {
+                    float hullLost = startHull - (damper.isAlive() ? damper.getHitpoints() : 0f);
+                    note(String.format("damper: CAT used it %b (option %s), hull lost %.0f, armor lost %.0f",
+                            catUsedDamper, damperOption, hullLost, startArmor - (damper.isAlive() ? armor(damper) : 0f)));
+                    expect(catUsedDamper, "damper: torpedoes its shield can't take -> CAT uses the damper ("
+                            + (damperOption == null ? "never used" : damperOption) + ")");
+                    expect(vanillaDamperUse == null, "damper: it never came on without CAT choosing it"
+                            + (vanillaDamperUse == null ? "" : " (" + vanillaDamperUse + ")"));
                     finish();
                 }
                 break;
+            }
             default:
                 break;
         }
@@ -332,6 +387,33 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
         expect(firstBackOff >= 0 && firstBackOff <= 240, String.format("%s: backs off within 4 s (at %.1fs)", name, firstBackOff / 60f));
         expect(firstBackOffReason != null && (firstBackOffReason.contains("HOLD ovl") || firstBackOffReason.contains("HOLD hull")),
                 name + ": the reason is the predicted danger of holding (" + firstBackOffReason + ")");
+    }
+
+    // the damper ship's latest prediction for one option: hull and armor lost, overload
+    private String predicted(String name) {
+        org.starficz.combataitweaks.predictor.RequestResult r = org.starficz.combataitweaks.predictor.PredictorManager.Companion
+                .getInstance(engine).latestResult(damper.getId(), name);
+        if (r == null) return "none";
+        org.starficz.combataitweaks.decide.MoveOption o = r.getOutlook().moveOption(name,
+                org.starficz.combataitweaks.decide.MoveKind.HOLD, false, engine.getTotalElapsedTime(false),
+                damper.getMaxFlux(), false, false, name.endsWith("+DEFENSE"));
+        return o == null ? "no damage run" : String.format("hull %.0f armor %.0f ovl %.1f", o.getHullLost(), o.getArmorLost(), o.getOverloadsIn());
+    }
+
+    // every frame: when the damper comes on, was a +DEFENSE option driven (CAT's use) or not (vanilla's)?
+    private void watchDamper() {
+        if (damper == null || !damper.isAlive() || damper.getSystem() == null) return;
+        boolean on = damper.getSystem().isOn();
+        if (on && !damperWasOn) {
+            Object option = damper.getCustomData().get(MoveController.OPTION);
+            boolean cat = Boolean.TRUE.equals(damper.getCustomData().get(
+                    org.starficz.combataitweaks.decide.DefenseController.USING));
+            note(String.format("damper came on at %s t=%.1fs, option %s, CAT using %b, state %s - %s", phase, age() / 60f,
+                    option, cat, state(damper), reason(damper)));
+            if (cat) { catUsedDamper = true; damperOption = option == null ? "standing down" : option.toString(); }
+            else if (vanillaDamperUse == null) vanillaDamperUse = phase + " with option " + option;
+        }
+        damperWasOn = on;
     }
 
     private void finish() {

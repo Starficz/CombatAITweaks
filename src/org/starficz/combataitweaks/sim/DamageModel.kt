@@ -394,6 +394,46 @@ class ArmorInfo(
     val hullDamageTakenMult: Float,
 )
 
+/**
+ * A ship system on at the snapshot on a defending ship (plan §11b): its effect on the ship's defences and what it
+ * forbids, for the rest of its on-time. [SimDefense] holds the values with the system off; these replace them while
+ * it is on.
+ */
+class DefenseSystem(
+    /** Engine seconds of the system still to come (charge-up, active and charge-down left); Float.MAX_VALUE: toggle. */
+    val onLeft: Float,
+    /** The charge-down part of [onLeft]: the protected ship doesn't count on its effect then (conservative). */
+    val chargeDown: Float,
+    val shieldDamageTakenMult: Float,
+    val armorDamageTakenMult: Float,
+    val hullDamageTakenMult: Float,
+    /** Shield upkeep, flux per second while the shield is up. */
+    val upkeep: Float,
+    /** Restrictions from the system's spec, over the whole [onLeft]. */
+    val noShield: Boolean = false,
+    val noVent: Boolean = false,
+    val noFiring: Boolean = false,
+    /** The system's own flux per second while on, and whether it is hard flux. */
+    val fluxPerSecond: Float = 0f,
+    val hardFlux: Boolean = false,
+    /**
+     * Engine seconds of charge-up still to come: the protected ship counts the effect only after it (conservative:
+     * some systems ramp up over it); an enemy's counts from the start.
+     */
+    val effectFrom: Float = 0f,
+) {
+    /** This system, ending after [left] engine seconds (turned off now: [left] is its charge-down). */
+    fun endingIn(left: Float) = DefenseSystem(left, chargeDown, shieldDamageTakenMult, armorDamageTakenMult,
+        hullDamageTakenMult, upkeep, noShield, noVent, noFiring, fluxPerSecond, hardFlux, effectFrom)
+}
+
+/**
+ * The protected ship's own system in one branch, in place of the captured [SimDefense.system] (plan §11b): CAT
+ * decides its defensive system, so a branch either uses it now ([system] is the planned use) or keeps it off (a
+ * toggle that is on turns off now; [system] then is its charge-down, or null).
+ */
+class SystemPlan(val system: DefenseSystem?)
+
 /** Everything about the protected ship (or one of its modules) that decides what a hit does to it. */
 class SimDefense(
     val shipId: String,
@@ -442,6 +482,8 @@ class SimDefense(
     /** Modules on this ship (armor modules, the Orthrus shell): hits that cross them land there first. */
     val modules: List<SimDefense> = emptyList(),
     val owner: Int = 0,
+    /** A system on at the snapshot (the damage-taken mults, upkeep and armor above are then its system-off values). */
+    val system: DefenseSystem? = null,
 ) {
     /** What the whole ship is worth in the cost unit (hull x 3 + armor): the base of its damage share (§13.3). */
     val worth: Float get() = maxHull * 3f + (armor?.rating ?: 0f)

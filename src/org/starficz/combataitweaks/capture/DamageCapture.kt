@@ -600,7 +600,11 @@ private fun ShipAPI.toDefense(withModules: Boolean): SimDefense {
         ShieldAPI.ShieldType.OMNI -> ShieldKind.OMNI
         else -> ShieldKind.NONE
     }
-    val armor = captureArmor()
+    // a system on now: the values below are with it off, its effect and restrictions go in [SimDefense.system]
+    val activeSystem = activeDefenseSystem()
+    val effectId = activeSystem?.specAPI?.id?.let { SystemProfiles.effectId(it) }
+    fun MutableStat.off() = if (effectId == null) modifiedValue else valueWithout(effectId)
+    val armor = captureArmor(effectId)
     val modules = if (withModules) childModulesCopy.filter { it.isAlive && !it.isHulk }.map { it.toDefense(false) }
                   else emptyList()
     val dissipation = stats.fluxDissipation.modifiedValue
@@ -624,9 +628,9 @@ private fun ShipAPI.toDefense(withModules: Boolean): SimDefense {
         shieldOn = s?.isOn == true,
         shieldActiveArc = s?.activeArc ?: 0f,
         unfoldTime = s?.unfoldTime ?: 0f,
-        upkeep = s?.upkeep ?: 0f,
+        upkeep = if (effectId == null) s?.upkeep ?: 0f else upkeepWithout(effectId),
         fluxPerDamage = s?.fluxPerPointOfDamage ?: 1f,
-        shieldDamageTakenMult = stats.shieldDamageTakenMult.value(),
+        shieldDamageTakenMult = stats.shieldDamageTakenMult.off(),
         shieldKindMult = floatArrayOf(
             stats.kineticShieldDamageTakenMult.value(), stats.highExplosiveShieldDamageTakenMult.value(),
             stats.fragmentationShieldDamageTakenMult.value(), stats.energyShieldDamageTakenMult.value(), 1f,
@@ -658,6 +662,7 @@ private fun ShipAPI.toDefense(withModules: Boolean): SimDefense {
         maxHull = maxHitpoints,
         modules = modules,
         owner = owner,
+        system = activeSystem?.let { captureDefenseSystem(it) },
     )
 }
 
@@ -671,7 +676,8 @@ private fun ShipAPI.geometry(): Geometry? {
     }
 }
 
-private fun ShipAPI.captureArmor(): ArmorInfo? {
+/** [effectId]: a system on now, whose modifiers are left out of the damage-taken mults. */
+private fun ShipAPI.captureArmor(effectId: String? = null): ArmorInfo? {
     val grid = armorGrid ?: return null
     val cells = grid.grid ?: return null
     val w = cells.size
@@ -685,12 +691,14 @@ private fun ShipAPI.captureArmor(): ArmorInfo? {
     return ArmorInfo(
         width = w, height = h, cells = flat, rating = grid.armorRating,
         originX = g.originX, originY = g.originY, axisIX = g.axisIX, axisIY = g.axisIY, axisJX = g.axisJX, axisJY = g.axisJY,
-        armorDamageTakenMult = stats.armorDamageTakenMult.value(),
+        armorDamageTakenMult = effectId?.let { stats.armorDamageTakenMult.valueWithout(it) }
+            ?: stats.armorDamageTakenMult.value(),
         kineticArmorDamageTakenMult = stats.kineticArmorDamageTakenMult.value(),
         effectiveArmorBonus = stats.effectiveArmorBonus.toBonus(),
         minArmorFraction = stats.minArmorFraction.value(),
         maxArmorDamageReduction = stats.maxArmorDamageReduction.value(),
-        hullDamageTakenMult = stats.hullDamageTakenMult.value(),
+        hullDamageTakenMult = effectId?.let { stats.hullDamageTakenMult.valueWithout(it) }
+            ?: stats.hullDamageTakenMult.value(),
     )
 }
 

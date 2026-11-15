@@ -44,12 +44,16 @@ class ArmorGrid(val info: ArmorInfo, private val rules: DamageRules, scratch: Sc
 
     /**
      * Applies one hit centred on cell (i, j). [damage] and [hitStrength] already carry the target's damage-taken
-     * mults. Returns the hull damage.
+     * mults. [armorTaken] and [hullTaken] replace the captured armor and hull damage-taken mults (a defensive system
+     * on). Returns the hull damage.
      */
-    fun hit(i: Int, j: Int, damage: Float, hitStrength: Float, kind: DamageKind, beam: Boolean): Float {
+    fun hit(
+        i: Int, j: Int, damage: Float, hitStrength: Float, kind: DamageKind, beam: Boolean,
+        armorTaken: Float = info.armorDamageTakenMult, hullTaken: Float = info.hullDamageTakenMult,
+    ): Float {
         lastArmorDamage = 0f
         if (damage <= 0f) return 0f
-        var m = rules.armorMult[kind.ordinal] * info.armorDamageTakenMult
+        var m = rules.armorMult[kind.ordinal] * armorTaken
         if (kind == DamageKind.KINETIC) m *= info.kineticArmorDamageTakenMult
         val dmg = damage * m
         var strength = hitStrength * m
@@ -63,7 +67,7 @@ class ArmorGrid(val info: ArmorInfo, private val rules: DamageRules, scratch: Sc
         val reduction = min(armor / (armor + strength), info.maxArmorDamageReduction)
         val dealt = dmg * (1f - reduction)
 
-        val hullMult = if (m > 0f) rules.hullMult[kind.ordinal] / m * info.hullDamageTakenMult else 0f
+        val hullMult = if (m > 0f) rules.hullMult[kind.ordinal] / m * hullTaken else 0f
         var hull = 0f
         var absorbed = 0f
         for (di in -2..2) for (dj in -2..2) {

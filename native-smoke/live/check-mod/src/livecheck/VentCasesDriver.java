@@ -34,6 +34,9 @@ import java.util.List;
 //             ballistic weapons carry the system's boost (fire rate x2, flux x0.5) and its system is ready now; fired
 //             from 600 at the CAT ship for 7 s its ballistics deal clearly more with the system than without; then
 //             with the system on, the captured weapons (system-off values) match the idle capture
+//  damper:    an own-side Centurion (damper as its ship system), then a Vanguard (damper in the right-click slot),
+//             parked 1500 below: idle the defence capture has no system; on, the system carries the live
+//             damage-taken mults, the ship's own stay the system-off values, with no shield, no vent and its on-time
 //  pursuit:   the aibattle Hound case (plan §14): a CAT Hound (no shield, default limits) at 90% hard flux, a Shrike
 //             (Plasma Burn on 1 of 2 charges, Heavy Blaster) 640 away, both free -> any vent CAT calls safe stays
 //             within its limits, and a burn on the last charge is captured running (not "out of ammo, never")
@@ -41,7 +44,15 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
     private static final Logger log = Global.getLogger(VentCasesDriver.class);
     private static final float HOUND_PARK_X = -9000f, HOUND_PARK_Y = 9000f, HOUND_X = -6000f, HOUND_Y = 3000f;
 
-    private enum Phase { WARMUP, CALM, CLEAR_1, TORPEDO_ARM, TORPEDO, CLEAR_2, BURN_ARM, BURN, CONTROL, CLEAR_3, DRONE_ARM, DRONE, FEEDER_ARM, FEEDER_ON, PURSUIT_ARM, PURSUIT, DONE }
+    private enum Phase { WARMUP, CALM, CLEAR_1, TORPEDO_ARM, TORPEDO, CLEAR_2, BURN_ARM, BURN, CONTROL, CLEAR_3, DRONE_ARM, DRONE, FEEDER_ARM, FEEDER_ON, DAMPER_ARM, DAMPER_ON, PURSUIT_ARM, PURSUIT, DONE }
+
+    // damper: own-side ships parked 1500 below, the damper as the ship system (Centurion) and in the right-click slot
+    // (Vanguard): idle, the capture has no system on; on, its effect goes to the system (the live values) while the
+    // ship's own values stay the system-off ones, with the damper's restrictions and its on-time
+    private static final String[] DAMPER_VARIANTS = { "centurion_Assault", "vanguard_Attack" };
+    private int damperIndex = 0;
+    private ShipAPI damperShip;
+    private org.starficz.combataitweaks.sim.SimDefense damperIdle;
 
     private CombatEngineAPI engine;
     private boolean active;
@@ -169,6 +180,14 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
             pin(feeder, 0f, 1500f);
             feeder.blockCommandForOneFrame(ShipCommand.FIRE);
             if (phase == Phase.FEEDER_ARM) feeder.blockCommandForOneFrame(ShipCommand.USE_SYSTEM);
+        }
+        if (damperShip != null && damperShip.isAlive()) {
+            pin(damperShip, 0f, -1500f);
+            damperShip.blockCommandForOneFrame(ShipCommand.FIRE);
+            if (phase == Phase.DAMPER_ARM) {
+                damperShip.blockCommandForOneFrame(ShipCommand.USE_SYSTEM);
+                damperShip.blockCommandForOneFrame(ShipCommand.TOGGLE_SHIELD_OR_PHASE_CLOAK);
+            }
         }
         if (tempest != null && tempest.isAlive()) {
             pin(tempest, 0f, 1300f);
@@ -311,12 +330,39 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
                     checkFeederOn(feederIdle, feederShooter());
                     engine.removeEntity(feeder);
                     feeder = null;
-                    enter(Phase.PURSUIT_ARM);
+                    startDamper(0);
                 } else if (age() > 300) {
                     expect(false, "feeder: the system came on when used (state " + (sys == null ? "-" : sys.getState()) + ")");
                     if (feeder != null) engine.removeEntity(feeder);
                     feeder = null;
-                    enter(Phase.PURSUIT_ARM);
+                    startDamper(0);
+                }
+                break;
+            }
+            case DAMPER_ARM:
+                if (age() >= 60 && damperShip != null) {
+                    damperIdle = damperDefense();
+                    String name = DAMPER_VARIANTS[damperIndex];
+                    expect(damperIdle != null && damperIdle.getSystem() == null,
+                            "damper " + name + ": idle, the capture has no system on");
+                    enter(Phase.DAMPER_ON);
+                }
+                break;
+            case DAMPER_ON: {
+                com.fs.starfarer.api.combat.ShipSystemAPI sys = damper();
+                boolean on = sys != null && sys.getState() == com.fs.starfarer.api.combat.ShipSystemAPI.SystemState.ACTIVE;
+                if (!on && sys != null && !sys.isOn() && age() % 10 == 1) {
+                    if (damperShip.getShield() != null && damperShip.getShield().isOn()) damperShip.getShield().toggleOff();
+                    if (sys == damperShip.getSystem()) damperShip.useSystem();
+                    else damperShip.giveCommand(ShipCommand.TOGGLE_SHIELD_OR_PHASE_CLOAK, null, 0);
+                }
+                if (on) {
+                    checkDamperOn(damperIdle, damperDefense());
+                    nextDamper();
+                } else if (age() > 300) {
+                    expect(false, "damper " + DAMPER_VARIANTS[damperIndex] + ": the damper came on when used (state "
+                            + (sys == null ? "no damper" : sys.getState()) + ")");
+                    nextDamper();
                 }
                 break;
             }
@@ -394,6 +440,64 @@ public class VentCasesDriver extends BaseEveryFrameCombatPlugin {
             default:
                 break;
         }
+    }
+
+    private void startDamper(int index) {
+        damperIndex = index;
+        damperIdle = null;
+        String variant = DAMPER_VARIANTS[index];
+        damperShip = engine.getFleetManager(0).spawnShipOrWing(variant, new Vector2f(0f, -1500f), 90f);
+        if (damperShip != null) damperShip.setCurrentCR(Math.max(damperShip.getCurrentCR(), 0.7f));
+        com.fs.starfarer.api.combat.ShipSystemAPI sys = damper();
+        expect(sys != null, "damper " + variant + ": spawned with a damper (" + (sys == null ? "none" : sys.getId()) + ")");
+        if (sys == null) { nextDamper(); return; }
+        enter(Phase.DAMPER_ARM);
+    }
+
+    private void nextDamper() {
+        if (damperShip != null) engine.removeEntity(damperShip);
+        damperShip = null;
+        if (damperIndex + 1 < DAMPER_VARIANTS.length) startDamper(damperIndex + 1);
+        else enter(Phase.PURSUIT_ARM);
+    }
+
+    /** The damper ship's damper: the right-click system or the ship system, as vanilla's DamperFieldStats.getDamper. */
+    private com.fs.starfarer.api.combat.ShipSystemAPI damper() {
+        if (damperShip == null) return null;
+        for (com.fs.starfarer.api.combat.ShipSystemAPI s : new com.fs.starfarer.api.combat.ShipSystemAPI[]{
+                damperShip.getPhaseCloak(), damperShip.getSystem()}) {
+            if (s != null && s.getId().startsWith("damper")) return s;
+        }
+        return null;
+    }
+
+    private org.starficz.combataitweaks.sim.SimDefense damperDefense() {
+        org.starficz.combataitweaks.sim.DamageInputs in = org.starficz.combataitweaks.capture.DamageCaptureKt
+                .captureDamage(engine, java.util.Collections.singleton(damperShip.getId()));
+        return in.getDefenses().get(damperShip.getId());
+    }
+
+    private void checkDamperOn(org.starficz.combataitweaks.sim.SimDefense idle, org.starficz.combataitweaks.sim.SimDefense on) {
+        String name = "damper " + DAMPER_VARIANTS[damperIndex];
+        expect(idle != null && on != null && idle.getArmor() != null && on.getArmor() != null, name + ": captured off and on");
+        if (idle == null || on == null || idle.getArmor() == null || on.getArmor() == null) return;
+        org.starficz.combataitweaks.sim.DefenseSystem sys = on.getSystem();
+        com.fs.starfarer.api.combat.MutableShipStatsAPI stats = damperShip.getMutableStats();
+        float liveArmor = stats.getArmorDamageTakenMult().getModifiedValue(), liveHull = stats.getHullDamageTakenMult().getModifiedValue();
+        note(String.format("%s on: live armor x%.2f hull x%.2f; captured off armor x%.2f hull x%.2f (idle x%.2f, x%.2f); system %s",
+                name, liveArmor, liveHull, on.getArmor().getArmorDamageTakenMult(), on.getArmor().getHullDamageTakenMult(),
+                idle.getArmor().getArmorDamageTakenMult(), idle.getArmor().getHullDamageTakenMult(),
+                sys == null ? "none" : String.format("armor x%.2f hull x%.2f onLeft %.2f chargeDown %.2f noShield %b noVent %b noFiring %b",
+                        sys.getArmorDamageTakenMult(), sys.getHullDamageTakenMult(), sys.getOnLeft(), sys.getChargeDown(),
+                        sys.getNoShield(), sys.getNoVent(), sys.getNoFiring())));
+        expect(sys != null && close(sys.getArmorDamageTakenMult(), liveArmor) && close(sys.getHullDamageTakenMult(), liveHull)
+                        && liveArmor < 0.5f * idle.getArmor().getArmorDamageTakenMult(),
+                name + ": on, the system carries the live damage-taken mults (the damper's cut)");
+        expect(close(on.getArmor().getArmorDamageTakenMult(), idle.getArmor().getArmorDamageTakenMult())
+                        && close(on.getArmor().getHullDamageTakenMult(), idle.getArmor().getHullDamageTakenMult()),
+                name + ": on, the ship's own mults stay the system-off values");
+        expect(sys != null && sys.getNoShield() && sys.getNoVent() && sys.getOnLeft() > 0f && sys.getOnLeft() < 3.6f,
+                name + ": the damper's restrictions (no shield, no vent) and its on-time");
     }
 
     private org.starficz.combataitweaks.sim.SimShooter feederShooter() {

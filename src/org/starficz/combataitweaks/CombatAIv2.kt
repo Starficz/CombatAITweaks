@@ -6,6 +6,7 @@ import com.fs.starfarer.api.combat.listeners.AdvanceableListener
 import com.fs.starfarer.api.util.IntervalUtil
 import org.json.JSONObject
 import org.lazywizard.lazylib.MathUtils
+import org.starficz.combataitweaks.decide.DefenseController
 import org.starficz.combataitweaks.decide.MoveController
 import org.starficz.combataitweaks.decide.MobilityPhases
 import org.starficz.combataitweaks.decide.ShieldController
@@ -93,11 +94,13 @@ class CombatAIv2(val ship: ShipAPI, val config: CombatAIConfig = CombatAIConfig(
 
     private val interval = IntervalUtil(0.05f, 0.1f)
     private val ventController = VentController(ship, config)
-    private val moveController = MoveController(ship, config)
+    private val defenseController = DefenseController(ship)
+    private val moveController = MoveController(ship, config, defenseController)
     private val shieldController = ShieldController(ship)
     private var latestResults: Map<String, org.starficz.combataitweaks.predictor.RequestResult> = emptyMap()
     private var fallback = true
     private var travel = false
+    private var defendStandingDown = false
 
     init { Global.getCombatEngine().customData[PredictorManager.FLAG_KEY] = true }
 
@@ -120,7 +123,11 @@ class CombatAIv2(val ship: ShipAPI, val config: CombatAIConfig = CombatAIConfig(
         // plan §13.9: the branch the ship is flying, else holding
         val flying = (ship.customData[MoveController.OPTION] as? String)?.let { latestResults[it] }
             ?: latestResults[PredictorManager.HOLD]
-        shieldController.apply(engine.getTotalElapsedTime(false), flying?.outlook)
+        val now = engine.getTotalElapsedTime(false)
+        shieldController.apply(now, flying?.outlook, holdUp = defenseController.holdsShield())
+        // plan §11b: CAT decides the defensive system, used only while a +DEFENSE option is driven (or, standing down,
+        // while HOLD+DEFENSE clearly beats HOLD)
+        defenseController.apply(if (fallback) defendStandingDown else moveController.choice?.option?.defense == true, now)
 
         if (fallback) {
             // nothing to fight: burn the mobility system to travel toward a far target, else leave it to vanilla
@@ -145,6 +152,7 @@ class CombatAIv2(val ship: ShipAPI, val config: CombatAIConfig = CombatAIConfig(
         if (target == null || !enemiesNear) {
             if (!fallback) moveController.standDown()
             fallback = true
+            defendStandingDown = defenseController.owned && moveController.standingDownDefense(now, results)
             travel = ship.shipTarget?.let { t ->
                 val range = (ship.aiFlags.getCustom(ShipwideAIFlags.AIFlags.MANEUVER_RANGE_FROM_TARGET) as? Float ?: 0f) + 50f
                 MathUtils.getDistance(t.location, ship.location) > range

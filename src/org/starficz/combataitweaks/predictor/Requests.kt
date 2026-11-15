@@ -3,6 +3,7 @@ package org.starficz.combataitweaks.predictor
 import org.starficz.combataitweaks.sim.DT
 import org.starficz.combataitweaks.sim.OwnPlan
 import org.starficz.combataitweaks.sim.Reaction
+import org.starficz.combataitweaks.sim.SystemPlan
 import org.starficz.combataitweaks.sim.Timeline
 import kotlin.math.ceil
 
@@ -16,9 +17,10 @@ object Constants {
 /**
  * One option a CAT ship wants predicted (plan §7): a name the decisions read it back by, what the ship does, and
  * whether to also resolve venting now. What its fire does to the enemies (the trade, plan §13.3) is resolved for
- * every option.
+ * every option. [system]: the ship's defensive system in this option, when CAT decides it (plan §11b); null: as
+ * captured.
  */
-class OptionRequest(val name: String, val plan: OwnPlan, val withVent: Boolean)
+class OptionRequest(val name: String, val plan: OwnPlan, val withVent: Boolean, val system: SystemPlan? = null)
 
 class RequestResult(
     val name: String,

@@ -80,6 +80,14 @@ class DefenseResolver(
     private val moduleTimelines: Map<String, Timeline>,
     /** Armor grid copies come from here when given (a lean run). */
     private val scratch: Scratch? = null,
+    /**
+     * How a system on at the snapshot ([SimDefense.system]) counts: false for the protected ship (its effect ends
+     * before its charge-down: it doesn't count on more), true for an enemy it fires at (the whole on-time: the worst
+     * case for the protected ship's trade). Its restrictions last the whole on-time either way.
+     */
+    private val systemWorstCase: Boolean = false,
+    /** The branch's own system for this ship, in place of the captured one (null: as captured). */
+    private val ownSystem: SystemPlan? = null,
 ) {
     /**
      * @param ownFire the ship's own weapons, run each step after that step's hits on the ship's flux: they fire only
@@ -94,8 +102,9 @@ class DefenseResolver(
     ): DefenseOutcome {
         val steps = timeline.steps
         val out = DefenseOutcome(steps, detail)
-        val state = State(defense, rules, scratch)
-        val modules = defense.modules.map { State(it, rules, scratch) }
+        val state = State(defense, rules, scratch, systemWorstCase,
+            if (ownSystem != null) ownSystem.system else defense.system)
+        val modules = defense.modules.map { State(it, rules, scratch, systemWorstCase) }
         if (plan == ShieldPlan.VENT_NOW) state.startVent()
 
         val held = ArrayList<Hit>()
@@ -103,6 +112,8 @@ class DefenseResolver(
         val tm = defense.timeMult
         for (i in 0 until steps) {
             val stepEnd = (i + 1) * DT
+            // a vent the system held back starts as soon as the system ends
+            if (state.ventPending && !state.ventBlocked()) state.startVent()
             val wasUp = state.shieldUpNow()
             while (next < hits.size && hits[next].time < stepEnd) {
                 val hit = hits[next++]
@@ -197,7 +208,10 @@ class DefenseResolver(
     }
 
     /** One ship's (or module's) mutable defences. */
-    private class State(val def: SimDefense, val rules: DamageRules, scratch: Scratch?) : FluxGate {
+    private class State(
+        val def: SimDefense, val rules: DamageRules, scratch: Scratch?, systemWorstCase: Boolean,
+        val sys: DefenseSystem? = def.system,
+    ) : FluxGate {
         var flux = def.flux
         var hardFlux = def.hardFlux
         var hull = def.hull
@@ -218,19 +232,40 @@ class DefenseResolver(
         var armorLostMax = 0f
         val grid = def.armor?.let { ArmorGrid(it, rules, scratch) }
 
-        /** Shield held down for the whole resolution (venting from t = 0). */
+        /** Shield held down for the whole resolution (venting from t = 0, or as soon as the system allows it). */
         var ventHeld = false
+        /** A vent ordered while the system forbids venting: it starts when the system ends. */
+        var ventPending = false
+
+        // a system on at the snapshot (or the branch's planned use): its effect, then its restrictions, until these
+        // engine times
+        private val sysEffectFrom = if (sys == null || systemWorstCase) 0f else sys.effectFrom
+        private val sysEffectUntil = when {
+            sys == null -> 0f
+            systemWorstCase || sys.onLeft == Float.MAX_VALUE -> sys.onLeft
+            else -> sys.onLeft - sys.chargeDown
+        }
+        private val sysOnUntil = sys?.onLeft ?: 0f
+        private fun engineTime() = time / def.timeMult
+        fun sysEffect() = sys != null && engineTime() < sysEffectUntil && engineTime() >= sysEffectFrom
+        fun sysOn() = sys != null && engineTime() < sysOnUntil
+
+        fun ventBlocked() = sys != null && sys.noVent && sysOn()
 
         fun startVent() {
-            venting = true
             ventHeld = true
             unfold = 0f
+            if (ventBlocked()) { ventPending = true; return }
+            ventPending = false
+            venting = true
         }
 
-        fun canShield() = def.shield != ShieldKind.NONE && !venting && overloadLeft <= 0f
+        fun canShield() = def.shield != ShieldKind.NONE && !venting && !ventHeld && overloadLeft <= 0f &&
+            !(sys != null && sys.noShield && sysOn())
 
-        // the ship's own weapons: they can't fire while venting or overloaded; firing costs soft flux
-        override fun silenced() = venting || overloadLeft > 0f
+        // the ship's own weapons: they can't fire while venting, overloaded or under a no-firing system; firing costs
+        // soft flux
+        override fun silenced() = venting || overloadLeft > 0f || (sys != null && sys.noFiring && sysOn())
         override fun affords(cost: Float) = flux + cost <= def.maxFlux
         override fun spend(cost: Float) { flux += cost }
         override fun level() = flux / def.maxFlux.coerceAtLeast(1f)
@@ -247,7 +282,8 @@ class DefenseResolver(
         fun shieldFluxOf(hit: Hit): Float {
             if (def.shield == ShieldKind.NONE) return 0f
             val d = hit.damage * def.shieldKindMult[hit.kind.ordinal] * def.shieldDeliveryMult[hit.delivery.ordinal]
-            return d * rules.shieldMult[hit.kind.ordinal] * def.shieldDamageTakenMult * def.fluxPerDamage
+            val taken = if (sysEffect()) sys!!.shieldDamageTakenMult else def.shieldDamageTakenMult
+            return d * rules.shieldMult[hit.kind.ordinal] * taken * def.fluxPerDamage
         }
 
         fun takeOnShield(hit: Hit, amount: Float, at: Float) {
@@ -292,14 +328,18 @@ class DefenseResolver(
             val beam = hit.delivery == Delivery.BEAM
             val g = grid
             val cell = if (g != null) def.rayCells[rayIndex(localAngle)] else -1
+            val on = sysEffect()
+            val hullTaken = if (on) sys!!.hullDamageTakenMult else def.armor?.hullDamageTakenMult ?: 1f
             val hullDamage = if (g != null && cell >= 0) {
                 val i = cell / g.height; val j = cell % g.height
-                val hullHit = g.hit(i, j, damage, strength, hit.kind, beam)
+                val hullHit = if (on) {
+                    g.hit(i, j, damage, strength, hit.kind, beam, sys!!.armorDamageTakenMult, hullTaken)
+                } else g.hit(i, j, damage, strength, hit.kind, beam)
                 val lost = g.armorAround(i, j, g.info.cells) - g.armorAround(i, j)
                 if (lost > armorLostMax) armorLostMax = lost
                 hullHit
             } else {
-                damage * rules.hullMult[hit.kind.ordinal] * (def.armor?.hullDamageTakenMult ?: 1f)
+                damage * rules.hullMult[hit.kind.ordinal] * hullTaken
             }
             hull = max(0f, hull - hullDamage)
         }
@@ -321,9 +361,17 @@ class DefenseResolver(
                 if (flux <= 0f && !ventHeld) venting = false
                 return
             }
-            if (def.shield != ShieldKind.NONE) {
+            if (sys != null && sys.fluxPerSecond > 0f && sysOn()) {
+                val added = min(sys.fluxPerSecond * dt, max(0f, def.maxFlux - flux))
+                flux += added
+                if (sys.hardFlux) hardFlux = min(hardFlux + added, flux)
+            }
+            if (canShield()) {
                 unfold = if (def.unfoldTime > 0f) min(1f, unfold + dt / def.unfoldTime) else 1f
-                flux = min(def.maxFlux, flux + def.upkeep * dt)
+                val upkeep = if (sysEffect()) sys!!.upkeep else def.upkeep
+                flux = min(def.maxFlux, flux + upkeep * dt)
+            } else {
+                unfold = 0f
             }
             // dissipation drains soft flux first; hard flux only with the shield down or by the dissipation stat
             val drained = max(0f, flux - def.dissipation * dt)

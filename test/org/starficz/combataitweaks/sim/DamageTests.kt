@@ -27,7 +27,7 @@ private fun defense(
     flux: Float = 0f, hard: Float = 0f, maxFlux: Float = 1000f, dissipation: Float = 100f, ventRate: Float = 250f,
     venting: Boolean = false, overload: Float = 0f, upkeep: Float = 0f, armor: ArmorInfo? = armorInfo(),
     hull: Float = 1000f, hullClass: HullClass = HullClass.FRIGATE, modules: List<SimDefense> = emptyList(),
-    id: String = "P", radius: Float = 50f, owner: Int = 0,
+    id: String = "P", radius: Float = 50f, owner: Int = 0, system: DefenseSystem? = null,
 ) = SimDefense(
     shipId = id, hullClass = hullClass, isDrone = false, collisionRadius = radius, hitRadius = radius, timeMult = 1f,
     shield = shield, shieldArc = arc, shieldOffset = 0f, shieldOn = shieldOn, shieldActiveArc = if (shieldOn) arc else 0f,
@@ -37,7 +37,7 @@ private fun defense(
     ventRate = ventRate, isVenting = venting, overloadLeft = overload, overloadTimeMod = Bonus.NONE,
     kindMult = FloatArray(5) { 1f }, deliveryMult = FloatArray(3) { 1f },
     armor = armor, rayCells = DefenseResolver.rayCells(armor, squareBounds, 40f), hull = hull, maxHull = hull,
-    modules = modules, owner = owner,
+    modules = modules, owner = owner, system = system,
 )
 
 private fun still(steps: Int = 200, x: Float = 0f, y: Float = 0f, facing: Float = 0f) = Timeline(steps).apply {
@@ -50,9 +50,91 @@ private fun hit(
     strength: Float = damage,
 ) = Hit(time, damage, strength, 0f, kind, delivery, soft, conservative, fromX, fromY, "E")
 
-private fun resolve(def: SimDefense, hits: List<Hit>, plan: ShieldPlan = ShieldPlan.NORMAL, steps: Int = 200) =
-    DefenseResolver(def, rules, still(steps), FloatArray(steps) { Float.NaN }, emptyMap())
-        .resolve(hits.sortedBy { it.time }, plan)
+private fun resolve(
+    def: SimDefense, hits: List<Hit>, plan: ShieldPlan = ShieldPlan.NORMAL, steps: Int = 200,
+    systemWorstCase: Boolean = false, ownFire: ((Int, FluxGate) -> Unit)? = null,
+) = DefenseResolver(def, rules, still(steps), FloatArray(steps) { Float.NaN }, emptyMap(), systemWorstCase = systemWorstCase)
+    .resolve(hits.sortedBy { it.time }, plan, ownFire)
+
+/** Systems on at the snapshot on the defending ship (plan §11b): effect window, restrictions, flux. */
+private fun defenseSystems() {
+    // a damper: armor and hull damage x0.33 for 3.25 s more, 0.25 of it charge-down; no shield, vent or firing
+    val damper = DefenseSystem(onLeft = 3.25f, chargeDown = 0.25f, shieldDamageTakenMult = 1f,
+        armorDamageTakenMult = 0.33f, hullDamageTakenMult = 0.33f, upkeep = 0f,
+        noShield = true, noVent = true, noFiring = true)
+    // no shield and no armor: an energy hit of 100 goes straight to hull x the hull damage-taken mult
+    val bare = defense(shield = ShieldKind.NONE, armor = null, system = damper)
+    fun lost(time: Float, worst: Boolean = false) =
+        resolve(bare, listOf(hit(time, 100f, DamageKind.ENERGY)), systemWorstCase = worst).hullLost.last()
+    near(lost(1f), 33f, 0.01f, "defense system: its effect counts while it is on")
+    near(lost(3.1f), 100f, 0.01f, "defense system: the protected ship doesn't count on its charge-down")
+    near(lost(3.1f, worst = true), 33f, 0.01f, "defense system: an enemy's counts to the end (worst case)")
+    near(lost(4f), 100f, 0.01f, "defense system: no effect once it ends")
+    // with armor: the grid's armor and hull mults are the system's
+    val armored = defense(shield = ShieldKind.NONE, system = damper)
+    val plainArmor = defense(shield = ShieldKind.NONE)
+    val withSys = resolve(armored, listOf(hit(1f, 400f, DamageKind.ENERGY))).armorLost.last()
+    val without = resolve(plainArmor, listOf(hit(1f, 400f, DamageKind.ENERGY))).armorLost.last()
+    check(withSys < without * 0.5f, "defense system: armor takes less under the damper") { "$withSys vs $without" }
+
+    // the shield is blocked while the system is on, and unfolds from nothing after it (0.5 s unfold)
+    val shielded = defense(shieldOn = false, system = DefenseSystem(onLeft = 2f, chargeDown = 0f,
+        shieldDamageTakenMult = 1f, armorDamageTakenMult = 1f, hullDamageTakenMult = 1f, upkeep = 0f, noShield = true))
+    val early = resolve(shielded, listOf(hit(1f, 100f, DamageKind.ENERGY)))
+    near(early.flux[early.at(1.05f)], 0f, 0.01f, "defense system: no shield while it forbids one")
+    check(early.armorLost.last() > 0f, "defense system: the hit lands on armor instead")
+    val late = resolve(shielded, listOf(hit(2.8f, 100f, DamageKind.ENERGY)))
+    check(late.armorLost.last() == 0f && late.flux[late.at(3f)] > 50f, "defense system: the shield is back after it") {
+        "armor ${late.armorLost.last()} flux ${late.flux[late.at(3f)]}"
+    }
+
+    // a vent ordered under a no-vent system starts when the system ends: 500 flux, dissipation 100, vent 250
+    val noVent = DefenseSystem(onLeft = 1f, chargeDown = 0f, shieldDamageTakenMult = 1f, armorDamageTakenMult = 1f,
+        hullDamageTakenMult = 1f, upkeep = 0f, noVent = true)
+    val held = resolve(defense(flux = 500f, system = noVent), emptyList(), ShieldPlan.VENT_NOW)
+    near(held.flux[held.at(1f)], 400f, 1f, "defense system: dissipation only until it allows the vent")
+    near(held.flux[held.at(2f)], 150f, 13f, "defense system: then the vent")
+    val free = resolve(defense(flux = 500f), emptyList(), ShieldPlan.VENT_NOW)
+    near(free.flux[free.at(1f)], 250f, 1f, "defense system: without it the vent starts at once")
+    check(held.shieldUp.none { it }, "defense system: no shield while the vent waits")
+
+    // a fortress-like toggle: shield damage x0.1, no upkeep (the plain shield's upkeep is 50)
+    val fortress = DefenseSystem(onLeft = Float.MAX_VALUE, chargeDown = 1.5f, shieldDamageTakenMult = 0.1f,
+        armorDamageTakenMult = 1f, hullDamageTakenMult = 1f, upkeep = 0f, noFiring = true)
+    val fort = resolve(defense(upkeep = 50f, dissipation = 0f, system = fortress), listOf(hit(1f, 100f, DamageKind.ENERGY)))
+    near(fort.shieldFlux.last(), 10f, 0.01f, "defense system: the shield takes the system's mult")
+    near(fort.flux.last(), 10f, 0.01f, "defense system: the system's upkeep replaces the shield's")
+
+    // the system's own flux while on: 50 hard flux per second for 2 s
+    val costly = DefenseSystem(onLeft = 2f, chargeDown = 0f, shieldDamageTakenMult = 1f, armorDamageTakenMult = 1f,
+        hullDamageTakenMult = 1f, upkeep = 0f, fluxPerSecond = 50f, hardFlux = true)
+    val cost = resolve(defense(shield = ShieldKind.NONE, dissipation = 0f, system = costly), emptyList())
+    near(cost.flux.last(), 100f, 1f, "defense system: its flux per second while on")
+    near(cost.hardFlux.last(), 100f, 1f, "defense system: hard flux when the spec says so")
+
+    // no firing while a no-firing system is on (the damper: 3.25 s = 65 steps)
+    var firing = 0
+    resolve(defense(system = damper), emptyList(), ownFire = { _, gate -> if (!gate.silenced()) firing++ })
+    check(abs(firing - (200 - 65)) <= 1, "defense system: the ship's own weapons are silenced while it is on") { "$firing" }
+
+    // a planned use (+DEFENSE): the effect only after its charge-up (0.25 s here), for the protected ship
+    val planned = damper.let { DefenseSystem(3.5f, 0.25f, 1f, 0.33f, 0.33f, 0f, noShield = true, noVent = true,
+        noFiring = true, effectFrom = 0.25f) }
+    fun plannedLost(time: Float, worst: Boolean = false) = DefenseResolver(defense(shield = ShieldKind.NONE, armor = null),
+        rules, still(200), FloatArray(200) { Float.NaN }, emptyMap(), systemWorstCase = worst, ownSystem = SystemPlan(planned))
+        .resolve(listOf(hit(time, 100f, DamageKind.ENERGY)), ShieldPlan.NORMAL).hullLost.last()
+    near(plannedLost(0.1f), 100f, 0.01f, "defense system: a planned use protects only after its charge-up")
+    near(plannedLost(0.1f, worst = true), 33f, 0.01f, "defense system: an enemy's from the start (worst case)")
+    near(plannedLost(1f), 33f, 0.01f, "defense system: the branch's planned use replaces the captured system")
+    // a branch keeping it off: SystemPlan(null) drops a captured system
+    val dropped = DefenseResolver(bare, rules, still(200), FloatArray(200) { Float.NaN }, emptyMap(), ownSystem = SystemPlan(null))
+        .resolve(listOf(hit(1f, 100f, DamageKind.ENERGY)), ShieldPlan.NORMAL).hullLost.last()
+    near(dropped, 100f, 0.01f, "defense system: a branch without it leaves out the captured one")
+    // turning a toggle off now: its restrictions last its charge-down, its effect none (protected ship)
+    val turningOff = fortress.endingIn(1.5f)
+    val off = resolve(defense(upkeep = 50f, dissipation = 0f, system = turningOff), listOf(hit(1f, 100f, DamageKind.ENERGY)))
+    near(off.shieldFlux.last(), 100f, 0.01f, "defense system: a toggle turning off protects no more")
+}
 
 private fun gun(
     damage: Float = 100f, range: Float = 800f, arc: Float = 30f, cooldown: Float = 1f, burst: Int = 1,
@@ -124,6 +206,7 @@ private fun systemThreats() {
 
 internal fun damage() {
     systemThreats()
+    defenseSystems()
     var worst = 0.0
     for (i in 0 until 3600) {
         val a = i * Math.PI / 1800.0

@@ -44,7 +44,7 @@ class DamageOutlook(val startTime: Float, val result: DamageResult?) {
      */
     fun moveOption(
         name: String, kind: MoveKind, system: Boolean, currentTime: Float, maxFlux: Float, escape: Boolean = false,
-        standoff: Boolean = false,
+        standoff: Boolean = false, defense: Boolean = false,
     ): MoveOption? {
         val o = result?.normal ?: return null
         val from = currentTime - startTime
@@ -63,6 +63,7 @@ class DamageOutlook(val startTime: Float, val result: DamageResult?) {
             escape = escape,
             trade = trade(from),
             standoff = standoff,
+            defense = defense,
         )
     }
 

@@ -73,15 +73,16 @@ object DamageSim {
      */
     fun branch(
         world: World, shipId: String, plan: OwnPlan, branch: BranchResult, inputs: DamageInputs, withVent: Boolean,
-        own: OwnFire, scratch: Scratch? = null,
+        own: OwnFire, scratch: Scratch? = null, ownSystem: SystemPlan? = null,
     ): PredictedBranch {
         val owner = world.byId[shipId]?.owner ?: return PredictedBranch(branch, null, Coupling.NONE)
-        var damage = run(shipId, owner, branch.timelines, inputs, withVent, own, pool = scratch?.also { it.reset() })
-            ?: return PredictedBranch(branch, null, Coupling.NONE)
+        var damage = run(shipId, owner, branch.timelines, inputs, withVent, own, pool = scratch?.also { it.reset() },
+            ownSystem = ownSystem) ?: return PredictedBranch(branch, null, Coupling.NONE)
         val coupling = Reactions.find(world, shipId, branch.committed.keys, damage)
         if (coupling.isEmpty()) return PredictedBranch(branch, damage, coupling)
         val final = if (coupling.reactions.isEmpty()) branch else world.branch(shipId, plan, coupling.reactions)
-        val again = run(shipId, owner, final.timelines, inputs, false, own, coupling, scratch?.also { it.reset() })
+        val again = run(shipId, owner, final.timelines, inputs, false, own, coupling, scratch?.also { it.reset() },
+            ownSystem)
         if (again != null) damage = again.withVentNow(damage.ventNow)
         return PredictedBranch(final, damage, coupling)
     }
@@ -105,6 +106,8 @@ object DamageSim {
          * outcomes leave out their detail arrays. The caller resets the pool once the run's hits are done with.
          */
         pool: Scratch? = null,
+        /** The ship's own system in this branch, in place of the captured one (plan §11b); null: as captured. */
+        ownSystem: SystemPlan? = null,
     ): DamageResult? {
         val defense = inputs.defenses[protectedId] ?: return null
         val timeline = timelines[protectedId] ?: return null
@@ -127,7 +130,8 @@ object DamageSim {
             combined
         } else noFacing(timeline.steps)
 
-        val resolver = DefenseResolver(defense, inputs.rules, timeline, omni, moduleTimelines(defense, timelines), pool)
+        val resolver = DefenseResolver(defense, inputs.rules, timeline, omni, moduleTimelines(defense, timelines), pool,
+            ownSystem = ownSystem)
         val shooter = inputs.shooterById[protectedId]
         val volley = if (shooter != null && targets.isNotEmpty()) {
             Volley(shooter, timeline, targets, targets.indexOfFirst { it.target.shipId == own!!.shipTargetId },
@@ -239,7 +243,8 @@ object DamageSim {
         all.sortBy { it.time }
         val omni = if (def.shield == ShieldKind.OMNI) sink.omniFacing(def.shieldArc)
                    else noFacing(sink.targetTimeline.steps)
-        val outcome = DefenseResolver(def, inputs.rules, sink.targetTimeline, omni, moduleTimelines(def, timelines), pool)
+        val outcome = DefenseResolver(def, inputs.rules, sink.targetTimeline, omni, moduleTimelines(def, timelines), pool,
+            systemWorstCase = true)
             .resolve(all, ShieldPlan.NORMAL, ownFiringFlux = incoming.firingFlux[def.shipId], detail = pool == null)
         return TargetOutcome(def, outcome, sink.hits.size + sink.launched.size)
     }

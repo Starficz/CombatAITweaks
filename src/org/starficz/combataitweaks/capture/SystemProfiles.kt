@@ -88,6 +88,12 @@ class StatView(
         return Triple(flat, percent, mult)
     }
 
+    /** The stat's value with [id]'s modifiers replaced by [with] (null: left out). */
+    fun valueWith(id: String, with: StatModifier?): Float {
+        val (flat, percent, mult) = sumsWithout(id, with)
+        return (base + base * percent / 100f + flat) * mult
+    }
+
     companion object {
         fun of(stat: MutableStat) = StatView(stat.baseValue, stat.flatMods, stat.percentMods, stat.multMods)
         fun of(stat: StatBonus, base: Float) = StatView(base, stat.flatBonuses, stat.percentBonuses, stat.multBonuses)
@@ -105,7 +111,9 @@ enum class ProfileStat(val column: String, val weapons: Boolean = true) {
     BALLISTIC_FLUX("ballistic_flux"), ENERGY_FLUX("energy_flux"), MISSILE_FLUX("missile_flux"), BEAM_FLUX("beam_flux"),
     BALLISTIC_RANGE("ballistic_range"), ENERGY_RANGE("energy_range"), MISSILE_RANGE("missile_range"),
     BEAM_RANGE("beam_range"),
-    MAX_SPEED("max_speed", false), ACCELERATION("acceleration", false), DECELERATION("deceleration", false);
+    MAX_SPEED("max_speed", false), ACCELERATION("acceleration", false), DECELERATION("deceleration", false),
+    SHIELD_DAMAGE_TAKEN("shield_damage_taken", false), ARMOR_DAMAGE_TAKEN("armor_damage_taken", false),
+    HULL_DAMAGE_TAKEN("hull_damage_taken", false), SHIELD_UPKEEP("shield_upkeep", false);
 
     fun statOf(s: MutableShipStatsAPI, base: Float = 1f): StatView = when (this) {
         BALLISTIC_ROF -> StatView.of(s.ballisticRoFMult)
@@ -126,6 +134,10 @@ enum class ProfileStat(val column: String, val weapons: Boolean = true) {
         MAX_SPEED -> StatView.of(s.maxSpeed)
         ACCELERATION -> StatView.of(s.acceleration)
         DECELERATION -> StatView.of(s.deceleration)
+        SHIELD_DAMAGE_TAKEN -> StatView.of(s.shieldDamageTakenMult)
+        ARMOR_DAMAGE_TAKEN -> StatView.of(s.armorDamageTakenMult)
+        HULL_DAMAGE_TAKEN -> StatView.of(s.hullDamageTakenMult)
+        SHIELD_UPKEEP -> StatView.of(s.shieldUpkeepMult)
     }
 
     /** Whether [m] on this stat makes a ship's weapons stronger (more fire rate, damage or range, less flux). */
@@ -148,10 +160,35 @@ class SystemProfile(
     val enforceOverride: Boolean = false,
     /** Where it came from, for the log and the trace: "code", the CSV row's source file, or "learned". */
     val source: String = "code",
+    /**
+     * Values for some hull sizes only ("frigate", "destroyer", "cruiser", "capital", "fighter"), over [stats]: the
+     * damper cuts damage more on small ships. [forSize] resolves them.
+     */
+    val bySize: Map<String, Map<ProfileStat, StatModifier>> = emptyMap(),
 ) {
     operator fun get(stat: ProfileStat): StatModifier? = stats[stat]
 
-    override fun toString() = "$systemId ($use, $source): " + stats.entries.joinToString { "${it.key.column} ${it.value}" }
+    /** This profile for one hull size: its [bySize] values replace the plain ones. */
+    fun forSize(size: String): SystemProfile {
+        val sized = bySize[size] ?: return this
+        return SystemProfile(systemId, use, stats + sized, enforceOverride, source)
+    }
+
+    override fun toString() = "$systemId ($use, $source): " + stats.entries.joinToString { "${it.key.column} ${it.value}" } +
+        bySize.entries.joinToString("") { (size, m) -> "; $size: " + m.entries.joinToString { "${it.key.column} ${it.value}" } }
+
+    companion object {
+        /** A hull size's name in [bySize]. */
+        fun sizeName(size: ShipAPI.HullSize?): String = when (size) {
+            ShipAPI.HullSize.FIGHTER -> "fighter"
+            ShipAPI.HullSize.FRIGATE -> "frigate"
+            ShipAPI.HullSize.DESTROYER -> "destroyer"
+            ShipAPI.HullSize.CRUISER -> "cruiser"
+            ShipAPI.HullSize.CAPITAL_SHIP -> "capital"
+            else -> "default"
+        }
+        val SIZES = setOf("fighter", "frigate", "destroyer", "cruiser", "capital")
+    }
 }
 
 object SystemProfiles {
@@ -171,7 +208,21 @@ object SystemProfiles {
     @JvmStatic
     fun of(systemId: String): SystemProfile? = registered[systemId] ?: fromCsv[systemId] ?: learned[systemId]
 
-    fun of(ship: ShipAPI): SystemProfile? = ship.system?.specAPI?.id?.let { of(it) }
+    /** The ship system's profile, for the ship's hull size. */
+    fun of(ship: ShipAPI): SystemProfile? = ship.system?.specAPI?.id?.let { of(it) }?.forSize(SystemProfile.sizeName(ship.hullSize))
+
+    /**
+     * The ship's defensive system with its profile (for the ship's hull size): the right-click system first, then the
+     * ship system (a damper can sit in either, as `DamperFieldStats.getDamper`); null when neither has a defensive
+     * profile.
+     */
+    fun defensive(ship: ShipAPI): Pair<ShipSystemAPI, SystemProfile>? {
+        for (sys in listOfNotNull(ship.phaseCloak, ship.system)) {
+            val p = sys.specAPI?.id?.let { of(it) } ?: continue
+            if (p.use == SystemUse.DEFENSIVE) return sys to p.forSize(SystemProfile.sizeName(ship.hullSize))
+        }
+        return null
+    }
 
     /** The id a system's stats script applies its modifiers under. */
     fun effectId(systemId: String) = "$systemId effect"
@@ -218,10 +269,27 @@ object SystemProfiles {
         if (id.isEmpty() || id.startsWith("#")) return null
         val use = SystemUse.valueOf(row.optString("use").trim().uppercase())
         val stats = HashMap<ProfileStat, StatModifier>()
+        val bySize = HashMap<String, HashMap<ProfileStat, StatModifier>>()
         for (stat in ProfileStat.entries) {
-            StatModifier.parse(row.optString(stat.column))?.let { if (!it.isNone) stats[stat] = it }
+            for ((sizes, m) in parseCell(row.optString(stat.column))) {
+                if (sizes == null) stats[stat] = m
+                else for (size in sizes) bySize.getOrPut(size) { HashMap() }[stat] = m
+            }
         }
         val enforce = row.optString("enforce_override").trim().equals("true", ignoreCase = true)
-        return SystemProfile(id, use, stats, enforce, row.optString("fs_rowSource", CSV_PATH))
+        return SystemProfile(id, use, stats, enforce, row.optString("fs_rowSource", CSV_PATH), bySize)
+    }
+
+    /**
+     * A cell: a modifier ("x0.33"), or several parts separated by ";", each optionally for some hull sizes only
+     * ("x0.33; cruiser capital: x0.5"). Returns (sizes or null for every size, modifier) per part.
+     */
+    fun parseCell(text: String): List<Pair<Set<String>?, StatModifier>> = text.split(";").mapNotNull { part ->
+        val colon = part.indexOf(':')
+        val sizes = if (colon < 0) null else part.substring(0, colon).trim().lowercase()
+            .split(Regex("[\\s,]+")).filter { it.isNotEmpty() }.toSet()
+        sizes?.firstOrNull { it !in SystemProfile.SIZES }?.let { throw IllegalArgumentException("unknown hull size '$it'") }
+        val m = StatModifier.parse(if (colon < 0) part else part.substring(colon + 1)) ?: return@mapNotNull null
+        sizes to m
     }
 }
