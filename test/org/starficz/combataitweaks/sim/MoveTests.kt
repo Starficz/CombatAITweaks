@@ -12,7 +12,7 @@ import org.starficz.combataitweaks.decide.Trade
 
 private fun opt(
     name: String, hull: Float = 0f, armor: Float = 0f, overloadsIn: Float = -1f, flux: Float = 0.3f,
-    hard: Float = 0.1f, trade: Trade? = null,
+    hard: Float = 0.1f, trade: Trade? = null, trouble: Float = 0f,
 ): MoveOption {
     val kind = when {
         name.startsWith("ADVANCE") -> MoveKind.ADVANCE
@@ -20,17 +20,17 @@ private fun opt(
         else -> MoveKind.HOLD
     }
     return MoveOption(name, kind, name.endsWith("+SYSTEM"), hull, armor, overloadsIn, flux, hard, escape = name.contains("~"),
-        trade = trade, standoff = name.startsWith("STANDOFF"), defense = name.endsWith("+DEFENSE"))
+        trade = trade, standoff = name.startsWith("STANDOFF"), defense = name.endsWith("+DEFENSE"), troubleIn = trouble)
 }
 
 private fun moveInputs(
     vararg options: MoveOption, venting: Boolean = false, ventOption: String? = null, flux: Float = 0.3f,
-    previous: MoveState? = null, gap: Float = 0f,
+    previous: MoveState? = null, gap: Float = 0f, lead: Float = 0.7f,
 ) = MoveInputs(
     options = options.toList(), venting = venting, ventOption = ventOption, fluxLevel = flux, hullLimit = 100f,
     previous = previous, advanceGap = gap,
     forceAdvanceIfFluxBelowLevel = 0.7f, backoffIfFluxAboveLevel = 0.85f, backoffIfHardfluxAboveLevel = 0.75f,
-    reengageIfFluxDropsBelowLevel = 0.4f, maxFluxLevelRaiseToHarass = 0.3f,
+    reengageIfFluxDropsBelowLevel = 0.4f, maxFluxLevelRaiseToHarass = 0.3f, defenseLead = lead,
 )
 
 /** The usual set: HOLD (keep still), HOLD~ / ADVANCE~ (do it, then escape), BACK_OFF. */
@@ -165,6 +165,22 @@ internal fun moveRule() {
         "move: only the defensive back-off is ok -> uses it") { runShielded.reason }
     val plainCalm = MoveRule.decide(moveInputs(*set(), opt("HOLD+DEFENSE")))
     check(plainCalm.option?.defense != true, "move: nothing threatening -> no defensive system") { plainCalm.reason }
+    // as late as still covers it: the trouble (first damage or overload) 3 s away, the lead 0.7 s -> not yet
+    val early = MoveRule.decide(moveInputs(opt("STANDOFF", armor = 400f, trouble = 3f), opt("STANDOFF+DEFENSE", armor = 120f),
+        opt("HOLD"), opt("ADVANCE~", overloadsIn = 4f), opt("BACK_OFF", armor = 500f)))
+    check(early.option?.name == "STANDOFF", "move: the damper waits while the trouble is further than its lead") { early.reason }
+    val due = MoveRule.decide(moveInputs(opt("STANDOFF", armor = 400f, trouble = 0.6f), opt("STANDOFF+DEFENSE", armor = 120f),
+        opt("HOLD"), opt("ADVANCE~", overloadsIn = 4f), opt("BACK_OFF", armor = 500f)))
+    check(due.option?.name == "STANDOFF+DEFENSE", "move: used once the trouble is within its lead") { due.reason }
+    val waitingHold = MoveRule.decide(moveInputs(opt("STANDOFF", overloadsIn = 3f, trouble = 3f), opt("STANDOFF+DEFENSE"),
+        opt("HOLD", overloadsIn = 3f), opt("ADVANCE~", overloadsIn = 2f), opt("BACK_OFF", overloadsIn = 4f)))
+    check(waitingHold.state == MoveState.HOLD && waitingHold.option?.name == "STANDOFF",
+        "move: waiting for the lead, the state stays HOLD (the damper makes it ok) on the plain standoff") { waitingHold.reason }
+    val waitingBack = MoveRule.decide(moveInputs(*set(holdEsc = stuck, advEsc = stuckAdv,
+        backOffs = listOf(opt("BACK_OFF", overloadsIn = 5f, trouble = 5f), opt("BACK_OFF+DEFENSE")))))
+    check(waitingBack.state == MoveState.BACK_OFF && waitingBack.option?.name == "BACK_OFF",
+        "move: a defensive back-off not due yet backs off plainly") { waitingBack.reason }
+
     val ventPlain = MoveRule.decide(moveInputs(*set(), opt("BACK_OFF+DEFENSE"), venting = true, ventOption = "BACK_OFF"))
     check(ventPlain.option?.name == "BACK_OFF", "move: venting never drives a defensive variant") { ventPlain.reason }
 

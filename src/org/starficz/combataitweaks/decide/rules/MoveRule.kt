@@ -48,6 +48,8 @@ class MoveOption(
      * without the suffix. Picked over it only when it clearly saves something ([MoveRule.withDefense]).
      */
     val defense: Boolean = false,
+    /** Seconds until the ship first loses armor or hull, or overloads (Float.MAX_VALUE: not within the horizon). */
+    val troubleIn: Float = Float.MAX_VALUE,
 ) {
     val cost get() = MoveRule.cost(armorLost, hullLost)
 }
@@ -70,6 +72,11 @@ class MoveInputs(
     val reengageIfFluxDropsBelowLevel: Float,
     /** The ship burns its system to advance only while the advance keeps flux at or below this. */
     val maxFluxLevelRaiseToHarass: Float,
+    /**
+     * How long before the trouble a `+DEFENSE` variant saves from the defensive system is used: its charge-up, a
+     * buffer against mispredicted timing, and the decision's latency ([MoveRule.withDefense]). 0: as soon as it saves.
+     */
+    val defenseLead: Float = 0f,
 )
 
 class MoveChoice(
@@ -207,7 +214,7 @@ object MoveRule {
     fun withDefense(i: MoveInputs, base: MoveOption?): MoveOption? {
         if (base == null) return null
         val d = defenseOf(i, base) ?: return base
-        return if (better(d, base, i.hullLimit)) d else base
+        return if (better(d, base, i.hullLimit) && due(base, i)) d else base
     }
 
     /**
@@ -220,6 +227,13 @@ object MoveRule {
         return d.cost <= base.cost * SYSTEM_GAIN && base.cost - d.cost >= SYSTEM_MIN_SAVING
     }
 
+    /**
+     * As late as still covers the trouble: the defensive system is used once [base]'s first armor or hull loss (or
+     * overload) is within [MoveInputs.defenseLead]. Until then the plain option is driven and a later decision uses it;
+     * the variant still counts for whether the state is ok.
+     */
+    private fun due(base: MoveOption, i: MoveInputs) = base.troubleIn <= i.defenseLead
+
     /** [state] with the option it drives and the reason line. */
     fun choose(state: MoveState, i: MoveInputs): MoveChoice {
         val option = when (state) {
@@ -228,12 +242,16 @@ object MoveRule {
                 // the option HOLD is judged by with its defensive system first: that may be what makes HOLD ok
                 val held = judged(i, MoveKind.HOLD)
                 val d = held?.let { defenseOf(i, it) }
-                if (held != null && d != null && better(d, held, i.hullLimit)) d
-                else withDefense(i, held?.takeIf { ok(it, i.hullLimit) } ?: stand(i) ?: held)
+                when {
+                    held != null && d != null && better(d, held, i.hullLimit) -> if (due(held, i)) d else held
+                    else -> withDefense(i, held?.takeIf { ok(it, i.hullLimit) } ?: stand(i) ?: held)
+                }
             }
             MoveState.BACK_OFF -> pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF && ok(it, i.hullLimit) },
-                i.hullLimit) ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF }, i.hullLimit)
-            MoveState.DISENGAGE -> pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF }, i.hullLimit)
+                i.hullLimit, i.defenseLead, i.options) ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF },
+                i.hullLimit, i.defenseLead, i.options)
+            MoveState.DISENGAGE -> pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF }, i.hullLimit, i.defenseLead,
+                i.options)
             MoveState.VENTING -> i.options.firstOrNull { it.name == i.ventOption && !it.system && !it.defense }
                 ?: pickBackOff(i.options.filter { it.kind == MoveKind.BACK_OFF && !it.system && !it.defense })
         }
@@ -256,7 +274,11 @@ object MoveRule {
      * ([VANILLA_BACK_OFF]), then the lowest end flux. A system variant only when it clearly saves something (keep the
      * system for later). The same for a `+DEFENSE` variant ([better]).
      */
-    fun pickBackOff(candidates: List<MoveOption>, hullLimit: Float = Float.MAX_VALUE): MoveOption? {
+    fun pickBackOff(
+        candidates: List<MoveOption>, hullLimit: Float = Float.MAX_VALUE, defenseLead: Float = 0f,
+        /** Every option, to find a defensive variant's plain twin among those [candidates] left out. */
+        all: List<MoveOption> = candidates,
+    ): MoveOption? {
         val plain = candidates.filter { !it.system && !it.defense }.minWithOrNull(compareBy<MoveOption>(
             { it.cost },
             { when (it.name) { ALLY_BACK_OFF -> 0; VANILLA_BACK_OFF -> 1; else -> 2 } },
@@ -270,6 +292,10 @@ object MoveRule {
             else -> plain
         }
         val d = candidates.filter { it.defense }.minByOrNull { it.cost } ?: return moving
+        // its trouble: the plain back-off it replaces (vanilla's direction), else the one it would drive
+        val plainOf = all.firstOrNull { !it.defense && d.name == it.name + DEFENSE_SUFFIX } ?: moving
+        // not due yet: the plain one (null here makes the caller look among the back-offs that aren't ok)
+        if (plainOf != null && plainOf.troubleIn > defenseLead) return moving
         return if (moving == null || better(d, moving, hullLimit)) d else moving
     }
 

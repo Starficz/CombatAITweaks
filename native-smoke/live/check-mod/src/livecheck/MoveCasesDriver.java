@@ -36,6 +36,7 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
     private enum Phase { WARMUP, ADVANCE, THREAT, AUTOMATED, STANDOFF, DAMPER, DONE }
 
     private ShipAPI damper;
+    private int damperOnAt = -1, firstDamageAt = -1;
     private boolean damperWasOn = false, catUsedDamper = false;
     private String vanillaDamperUse = null, damperOption = null;
     private final List<com.fs.starfarer.api.combat.CombatEntityAPI> torpedoes = new java.util.ArrayList<>();
@@ -356,6 +357,9 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
                             damper.getSystem() == null ? "-" : damper.getSystem().getState(), damper.getFluxLevel(),
                             predicted("HOLD"), predicted("HOLD+DEFENSE"), reason(damper)));
                 }
+                if (firstDamageAt < 0 && (damper.getHitpoints() < startHull - 1f || armor(damper) < startArmor - 1f)) {
+                    firstDamageAt = age();
+                }
                 boolean gone = age() > 20 && torpedoes.stream().noneMatch(engine::isEntityInPlay);
                 if ((gone && age() > 240) || age() > 600 || !damper.isAlive()) {
                     float hullLost = startHull - (damper.isAlive() ? damper.getHitpoints() : 0f);
@@ -363,6 +367,13 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
                             catUsedDamper, damperOption, hullLost, startArmor - (damper.isAlive() ? armor(damper) : 0f)));
                     expect(catUsedDamper, "damper: torpedoes its shield can't take -> CAT uses the damper ("
                             + (damperOption == null ? "never used" : damperOption) + ")");
+                    // as late as still covers the hits, with a buffer: on before the first hit, the hit inside its
+                    // 3 s active time (it comes on 0.25 s after use)
+                    float lead = (firstDamageAt - damperOnAt) / 60f;
+                    note(String.format("damper: came on at %.2fs, first damage at %.2fs: %.2fs before it",
+                            damperOnAt / 60f, firstDamageAt / 60f, lead));
+                    expect(damperOnAt >= 0 && firstDamageAt > damperOnAt && lead <= 3f,
+                            String.format("damper: on before the first hit, the hit inside its window (%.2fs before)", lead));
                     expect(vanillaDamperUse == null, "damper: it never came on without CAT choosing it"
                             + (vanillaDamperUse == null ? "" : " (" + vanillaDamperUse + ")"));
                     finish();
@@ -411,6 +422,7 @@ public class MoveCasesDriver extends BaseEveryFrameCombatPlugin {
             note(String.format("damper came on at %s t=%.1fs, option %s, CAT using %b, state %s - %s", phase, age() / 60f,
                     option, cat, state(damper), reason(damper)));
             if (cat) { catUsedDamper = true; damperOption = option == null ? "standing down" : option.toString(); }
+            if (phase == Phase.DAMPER && damperOnAt < 0) damperOnAt = age();
             else if (vanillaDamperUse == null) vanillaDamperUse = phase + " with option " + option;
         }
         damperWasOn = on;

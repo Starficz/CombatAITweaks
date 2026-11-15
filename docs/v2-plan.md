@@ -697,9 +697,12 @@ read the damage-taken mults and upkeep as they were, so a damper on at the snaps
   case: a CAT Centurion pinned, two Reapers from 1200, then 85% hard flux: CAT uses the damper (standing down: no ship
   near; the prediction without it 1617 hull, it lost 440), and the damper never came on without CAT choosing it over
   the whole run. `ventcases`, `aibattle`, `worstcase` pass.
-- Next refinements: use it as late as still covers the hits (it is used as soon as a use saves: in the case above the
-  torpedoes landed 3.1 s into its 3.25 s); the fortress shield not yet seen in game; enemy defensive systems in P's
-  trade (only one already on counts).
+- As late as still covers the hits (2026-11-15): a `+DEFENSE` variant is driven only once its plain option's first
+  armor or hull loss (or overload) is within the lead: the charge-up + 0.35 s against mispredicted timing + 0.1 s of
+  decision latency (`DefenseController.lead`); until then the plain option is driven, and the variant still makes the
+  state ok. In the damper case it came on 0.70 s before the first hit (it had been 3.1 s).
+- Next refinements: the fortress shield not yet seen in game; enemy defensive systems in P's trade (only one already
+  on counts).
 - Tests: unit 327 (`defenseSystems`: effect window, charge-down for P and the worst case, armor, the shield blocked
   and unfolding after, the held vent, a fortress-like toggle's shield mult and upkeep, system flux, silenced fire).
   `ventcases` damper case: an own-side Centurion (damper as the ship system) and Vanguard (damper in the right-click

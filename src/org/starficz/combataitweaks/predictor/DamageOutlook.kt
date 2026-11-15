@@ -64,7 +64,32 @@ class DamageOutlook(val startTime: Float, val result: DamageResult?) {
             trade = trade(from),
             standoff = standoff,
             defense = defense,
+            troubleIn = troubleIn(o, from),
         )
+    }
+
+    /**
+     * Seconds from [from] (after the snapshot) until the ship first loses armor or hull, or overloads, in [o];
+     * Float.MAX_VALUE when it doesn't within the horizon.
+     */
+    private fun troubleIn(o: DefenseOutcome, from: Float): Float {
+        val start = if (from < org.starficz.combataitweaks.sim.DT) -1 else o.at(from)
+        val armor0 = if (start < 0) 0f else o.armorLost[start]
+        val hull0 = if (start < 0) 0f else o.hullLost[start]
+        var t = Float.MAX_VALUE
+        for (i in (start + 1) until o.steps) {
+            if (o.armorLost[i] > armor0 + TROUBLE_EPS || o.hullLost[i] > hull0 + TROUBLE_EPS) {
+                t = (i + 1) * org.starficz.combataitweaks.sim.DT - from
+                break
+            }
+        }
+        if (o.overloadStart >= from) t = minOf(t, o.overloadStart - from)
+        return t.coerceAtLeast(0f)
+    }
+
+    companion object {
+        /** Armor or hull lost below this is nothing (rounding, a stray fragment). */
+        private const val TROUBLE_EPS = 1f
     }
 
     /**

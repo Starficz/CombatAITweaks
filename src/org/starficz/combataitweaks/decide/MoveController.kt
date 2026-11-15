@@ -240,6 +240,7 @@ class MoveController(
         backoffIfHardfluxAboveLevel = config.backoffIfHardfluxAboveLevel,
         reengageIfFluxDropsBelowLevel = config.reengageIfFluxDropsBelowLevel,
         maxFluxLevelRaiseToHarass = config.maxFluxLevelRaiseToHarass,
+        defenseLead = defense.lead(),
     )
 
     /**

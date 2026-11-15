@@ -49,6 +49,15 @@ class DefenseController(private val ship: ShipAPI) {
         return SystemPlan(ship.plannedDefenseSystem(s, profile))
     }
 
+    /**
+     * How long before the trouble the system is used (plan §11b, as late as still covers it): its charge-up, a
+     * [BUFFER] against mispredicted timing, and the [LATENCY] of the decision (tick, then the command next frame).
+     */
+    fun lead(): Float {
+        val s = sys ?: return 0f
+        return s.chargeUpDur / timeMult() + BUFFER + LATENCY
+    }
+
     /** Whether the shield must stay up: a shield system (the fortress shield) is on. */
     fun holdsShield(): Boolean {
         val (s, profile) = found ?: return false
@@ -88,6 +97,10 @@ class DefenseController(private val ship: ShipAPI) {
     companion object {
         /** Custom-data key: whether CAT wants the defensive system used now (the trace, the checks). */
         const val USING = "CAT_DEFENSE_USING"
+        /** Margin for mispredicted hit times (the trouble arriving earlier than predicted). */
+        const val BUFFER = 0.35f
+        /** Decision tick (up to 0.1 s) and the command landing next frame. */
+        const val LATENCY = 0.1f
         /** A toggle CAT turned on stays on this long (its charge-up and charge-down make flapping costly). */
         const val MIN_TOGGLE_ON = 3f
     }
